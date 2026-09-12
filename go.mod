@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/golang-migrate/migrate/v4 v4.17.1
+	golang.org/x/crypto v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.58.0
 )
