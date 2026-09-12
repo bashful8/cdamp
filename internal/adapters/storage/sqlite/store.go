@@ -12,7 +12,7 @@ import (
 	migratelib "github.com/golang-migrate/migrate/v4"
 	migsqlite "github.com/golang-migrate/migrate/v4/database/sqlite"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
-	_ "modernc.org/sqlite"
+	msqlite "modernc.org/sqlite"
 
 	"cdamp/internal/domain"
 )
@@ -24,33 +24,50 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-// ErrQueryNotSupported is returned by ListMessages when f.Query is set.
-// FTS5-backed search (MessageFilter.Query and SearchThreads) is Phase 2
-// task 2's job, not this one's — callers must not silently get an
-// unfiltered result set when they asked for a text match.
-var ErrQueryNotSupported = errors.New("sqlite: query (FTS) filtering is not implemented yet")
-
-// messageColumns is the column list, in a fixed order, shared by every
+// messageColumnNames is the column list, in a fixed order, shared by every
 // SELECT against messages so scanMessage's positional Scan stays in sync
-// with the query text.
-const messageColumns = `id, thread_id, agent_id, direction, from_addr, to_addr, sender_domain,
-	subject, body, priority, in_reply_to, idempotency_key, sent_at,
-	expires_at, trust, status, read, next_attempt, attempts, fail_reason`
+// with the query text. messageColumns (comma-joined, for plain
+// SELECT ... FROM messages queries) and qualifiedMessageColumns (each name
+// prefixed with a table alias, for queries that JOIN messages against
+// messages_fts — whose own subject/body columns would otherwise be
+// ambiguous unqualified) both derive from this single slice so a future
+// schema change only needs updating here.
+var messageColumnNames = []string{
+	"id", "thread_id", "agent_id", "direction", "from_addr", "to_addr", "sender_domain",
+	"subject", "body", "priority", "in_reply_to", "idempotency_key", "sent_at",
+	"expires_at", "trust", "status", "read", "next_attempt", "attempts", "fail_reason",
+}
 
-// Store implements the non-FTS, non-retry-queue half of domain.InboxStore
-// (SaveMessage, GetMessage, GetThread, ListMessages) on top of a single
-// SQLite file opened via modernc.org/sqlite (pure Go, no cgo).
-//
-// Store intentionally does not implement domain.InboxStore in full yet:
-// ClaimPending, MarkDelivered, MarkFailed, FindByIdempotencyKey, and
-// SearchThreads (plus MessageFilter.Query support in ListMessages) are
-// Phase 2 task 2's job. Adding stub methods that panic would let *Store
-// satisfy the interface today only to panic at runtime tomorrow, which is
-// worse than just not claiming the interface yet — so *Store is never
-// assigned to a domain.InboxStore-typed variable anywhere in this package.
+var messageColumns = strings.Join(messageColumnNames, ", ")
+
+// qualifiedMessageColumns returns messageColumnNames each prefixed with
+// "<alias>." — see messageColumnNames's doc comment.
+func qualifiedMessageColumns(alias string) string {
+	qualified := make([]string, len(messageColumnNames))
+	for i, c := range messageColumnNames {
+		qualified[i] = alias + "." + c
+	}
+	return strings.Join(qualified, ", ")
+}
+
+// sqliteConstraintUniqueCode is SQLite's extended result code for a
+// UNIQUE-constraint violation (SQLITE_CONSTRAINT_UNIQUE in sqlite3.h;
+// modernc.org/sqlite enables extended result codes on every connection by
+// default). messages has exactly one UNIQUE index — idx_messages_idem, a
+// partial unique index on idempotency_key; messages.id's own uniqueness is
+// enforced as a PRIMARY KEY, which SQLite reports under the distinct
+// SQLITE_CONSTRAINT_PRIMARYKEY code — so this code arriving from an
+// INSERT INTO messages can only mean idx_messages_idem was violated.
+const sqliteConstraintUniqueCode = 2067
+
+// Store implements domain.InboxStore on top of a single SQLite file opened
+// via modernc.org/sqlite (pure Go, no cgo).
 type Store struct {
 	db *sql.DB
 }
+
+// Compile-time assertion that *Store satisfies domain.InboxStore in full.
+var _ domain.InboxStore = (*Store)(nil)
 
 // Open opens (creating if necessary) the SQLite database file at path,
 // enables WAL mode + a busy timeout + foreign-key enforcement via DSN
@@ -81,7 +98,23 @@ type Store struct {
 // exactly as specified — only the filename suffix was adjusted to make
 // the required library able to run it.
 func Open(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", path)
+	// _txlock=immediate makes every transaction this Store opens via
+	// (*sql.DB).BeginTx issue "BEGIN IMMEDIATE" instead of SQLite's default
+	// "BEGIN DEFERRED" — modernc.org/sqlite reads this DSN parameter and
+	// applies it to every non-read-only Begin on the connection (see
+	// modernc.org/sqlite's tx.go: newTx picks "begin "+beginMode when set).
+	// This is what ClaimPending's concurrency contract (cdamp-sqlite-fts
+	// skill, "ClaimPending concurrency") requires: BEGIN IMMEDIATE takes
+	// the write lock up front, so two concurrent ClaimPending
+	// transactions serialize on it (the loser blocks for up to the
+	// busy_timeout below, then proceeds against the post-commit state)
+	// instead of both reading the same due rows before either commits.
+	// Applying it to every transaction (not just ClaimPending's) rather
+	// than a one-off "BEGIN IMMEDIATE" statement is also strictly safer
+	// for SaveMessage's existing transaction: BEGIN DEFERRED's classic
+	// footgun is a mid-transaction upgrade from a read lock to a write
+	// lock failing with SQLITE_BUSY after other work has already run.
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_txlock=immediate", path)
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -172,6 +205,10 @@ func (s *Store) SaveMessage(ctx context.Context, m *domain.Message) error {
 		m.SentAt.Unix(), toNullUnix(m.ExpiresAt), m.Trust, m.Status, boolToInt(m.Read),
 		toNullUnix(m.NextAttempt), m.Attempts,
 	); err != nil {
+		var sqliteErr *msqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqliteConstraintUniqueCode {
+			return domain.ErrDuplicateIdempotencyKey
+		}
 		return fmt.Errorf("saving message %s: inserting message: %w", m.ID, err)
 	}
 
@@ -253,14 +290,15 @@ func (s *Store) GetThread(ctx context.Context, id string) (*domain.Thread, []*do
 // well-defined: pages resume strictly after that row's (sent_at, id)
 // position.
 //
-// f.Query (FTS5 matching) is not implemented here — that lands in Phase 2
-// task 2 alongside SearchThreads. Passing a non-empty f.Query returns
-// ErrQueryNotSupported rather than silently ignoring it.
+// f.Query, when set, narrows to messages matching it via the messages_fts
+// FTS5 index (never a LIKE scan on subject/body — see the cdamp-sqlite-fts
+// skill's "FTS5 sync triggers" section). This adds a JOIN against
+// messages_fts and one more WHERE term to the same filter-building logic
+// used for From/Thread/Status/Unread/After below; it doesn't change how
+// any of those combine. An empty f.Query skips the join entirely and
+// falls back to the plain indexed scan already used for every other
+// filter combination.
 func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*domain.Message, error) {
-	if f.Query != "" {
-		return nil, ErrQueryNotSupported
-	}
-
 	limit := f.Limit
 	if limit <= 0 {
 		limit = 50
@@ -269,8 +307,23 @@ func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*do
 		limit = 200
 	}
 
+	from := "messages"
+	cols := messageColumns
 	where := []string{"agent_id = ?"}
 	args := []any{f.AgentID}
+
+	if f.Query != "" {
+		// agent_id/from_addr/thread_id/status/read/sent_at/id all exist
+		// only on messages, never on messages_fts (whose columns are just
+		// subject, body, plus the implicit rowid/rank) — so referencing
+		// them unqualified stays unambiguous even under this join, and
+		// only the SELECT list (messageColumns, which does include
+		// subject/body) needs table-qualifying.
+		from = "messages m JOIN messages_fts ON messages_fts.rowid = m.rowid"
+		cols = qualifiedMessageColumns("m")
+		where = append(where, "messages_fts MATCH ?")
+		args = append(args, f.Query)
+	}
 
 	if f.From != "" {
 		where = append(where, "from_addr = ?")
@@ -292,7 +345,7 @@ func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*do
 		args = append(args, f.After)
 	}
 
-	query := "SELECT " + messageColumns + " FROM messages WHERE " + strings.Join(where, " AND ") +
+	query := "SELECT " + cols + " FROM " + from + " WHERE " + strings.Join(where, " AND ") +
 		" ORDER BY sent_at, id LIMIT ?"
 	args = append(args, limit)
 
@@ -315,6 +368,262 @@ func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*do
 	}
 
 	return messages, nil
+}
+
+// ClaimPending atomically selects up to limit outbound messages due for a
+// delivery attempt (direction='out', status='pending', next_attempt NULL
+// or already past), marks them 'claimed', and returns their full rows —
+// all inside one transaction, per the cdamp-sqlite-fts skill's
+// "ClaimPending concurrency" section and 02-ARCHITECTURE.md's Delivery
+// worker flow. Because Open's DSN sets _txlock=immediate (see Open's doc
+// comment), the BeginTx below issues "BEGIN IMMEDIATE" rather than
+// SQLite's default "BEGIN DEFERRED": it takes the write lock up front, so
+// a second concurrent ClaimPending call blocks (for up to the busy_timeout
+// pragma) until this one commits, instead of both selecting the same due
+// rows before either writes 'claimed'.
+//
+// 'claimed' is a transient in-process status with no CHECK constraint
+// guarding messages.status (03-API.md schema), resolved by a later
+// MarkDelivered or MarkFailed call. Results are ordered by sent_at, the
+// same "oldest due first" order the skill's reference query uses.
+func (s *Store) ClaimPending(ctx context.Context, limit int) ([]*domain.Message, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("claiming pending messages: beginning transaction: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	now := time.Now().Unix()
+	idRows, err := tx.QueryContext(ctx, `
+		SELECT id FROM messages
+		WHERE direction = 'out' AND status = 'pending' AND (next_attempt IS NULL OR next_attempt <= ?)
+		ORDER BY sent_at
+		LIMIT ?
+	`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claiming pending messages: selecting due ids: %w", err)
+	}
+	var ids []string
+	for idRows.Next() {
+		var id string
+		if err := idRows.Scan(&id); err != nil {
+			idRows.Close()
+			return nil, fmt.Errorf("claiming pending messages: scanning id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := idRows.Err(); err != nil {
+		idRows.Close()
+		return nil, fmt.Errorf("claiming pending messages: iterating ids: %w", err)
+	}
+	idRows.Close()
+
+	if len(ids) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("claiming pending messages: committing empty claim: %w", err)
+		}
+		return nil, nil
+	}
+
+	placeholders, args := idInArgs(ids)
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE messages SET status = 'claimed' WHERE id IN ("+placeholders+")", args...,
+	); err != nil {
+		return nil, fmt.Errorf("claiming pending messages: marking claimed: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		"SELECT "+messageColumns+" FROM messages WHERE id IN ("+placeholders+") ORDER BY sent_at, id", args...)
+	if err != nil {
+		return nil, fmt.Errorf("claiming pending messages: reselecting claimed rows: %w", err)
+	}
+	var messages []*domain.Message
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("claiming pending messages: scanning claimed message: %w", err)
+		}
+		messages = append(messages, m)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("claiming pending messages: iterating claimed messages: %w", err)
+	}
+	rows.Close()
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("claiming pending messages: committing: %w", err)
+	}
+
+	return messages, nil
+}
+
+// idInArgs builds a "?,?,?"-style placeholder list and the corresponding
+// []any argument slice for an `id IN (...)` clause over ids.
+func idInArgs(ids []string) (placeholders string, args []any) {
+	ph := make([]string, len(ids))
+	args = make([]any, len(ids))
+	for i, id := range ids {
+		ph[i] = "?"
+		args[i] = id
+	}
+	return strings.Join(ph, ","), args
+}
+
+// MarkDelivered sets a message's status to 'delivered'. Returns
+// domain.ErrNotFound if no message with the given id exists.
+func (s *Store) MarkDelivered(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, "UPDATE messages SET status = 'delivered' WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("marking message %s delivered: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("marking message %s delivered: %w", id, err)
+	}
+	if n == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// MarkFailed records a failed delivery attempt: fail_reason is set and
+// attempts incremented unconditionally. What happens to status/next_attempt
+// depends on whether a retry remains, per 02-ARCHITECTURE.md's Delivery
+// worker flow read together with ClaimPending's own status='pending'
+// filter — status going back to 'pending' is the *only* way a retryable
+// failure is ever reclaimed by a later ClaimPending:
+//
+//   - nextAttempt != nil (more retries scheduled): status goes back to
+//     'pending' with next_attempt set, so ClaimPending picks it up again
+//     once due.
+//   - nextAttempt == nil (backoff schedule exhausted): status becomes the
+//     terminal 'failed', next_attempt cleared to NULL.
+//
+// Returns domain.ErrNotFound if no message with the given id exists.
+func (s *Store) MarkFailed(ctx context.Context, id string, nextAttempt *time.Time, reason string) error {
+	var (
+		res sql.Result
+		err error
+	)
+	if nextAttempt != nil {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE messages
+			SET status = 'pending', next_attempt = ?, attempts = attempts + 1, fail_reason = ?
+			WHERE id = ?
+		`, nextAttempt.Unix(), reason, id)
+	} else {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE messages
+			SET status = 'failed', next_attempt = NULL, attempts = attempts + 1, fail_reason = ?
+			WHERE id = ?
+		`, reason, id)
+	}
+	if err != nil {
+		return fmt.Errorf("marking message %s failed: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("marking message %s failed: %w", id, err)
+	}
+	if n == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+// FindByIdempotencyKey looks up a message by its idempotency key. An empty
+// key means "no idempotency key was provided" (idx_messages_idem is a
+// partial unique index over non-NULL values only — see toNullString's doc
+// comment), never a lookup key, so it short-circuits to domain.ErrNotFound
+// without touching the database. Otherwise returns domain.ErrNotFound on
+// no match.
+func (s *Store) FindByIdempotencyKey(ctx context.Context, key string) (*domain.Message, error) {
+	if key == "" {
+		return nil, domain.ErrNotFound
+	}
+	row := s.db.QueryRowContext(ctx, "SELECT "+messageColumns+" FROM messages WHERE idempotency_key = ?", key)
+	m, err := scanMessage(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("finding message by idempotency key: %w", err)
+	}
+	return m, nil
+}
+
+// SearchThreads returns threads containing at least one message belonging
+// to agentID, ordered by (created_at, id) and paginated via f.After/
+// f.Limit with the same strictly-resume-past-cursor, default-50/cap-200
+// discipline ListMessages uses for messages.
+//
+// When query is non-empty, results are narrowed to threads where at least
+// one message matches it via the messages_fts index — "a thread matches q
+// if any message in it matches" (03-API.md, GET /threads) — which is why
+// this joins threads -> messages -> messages_fts rather than searching a
+// thread's own subject: the matching message need not be the one that
+// created the thread. DISTINCT collapses threads with more than one
+// matching message down to one row. An empty query skips the FTS join
+// entirely and returns a plain scan of every thread with at least one
+// message for agentID, mirroring ListMessages' handling of an empty
+// f.Query.
+func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, f domain.ThreadFilter) ([]*domain.Thread, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	from := "threads t JOIN messages m ON m.thread_id = t.id"
+	where := []string{"m.agent_id = ?"}
+	args := []any{agentID}
+
+	if query != "" {
+		from += " JOIN messages_fts ON messages_fts.rowid = m.rowid"
+		where = append(where, "messages_fts MATCH ?")
+		args = append(args, query)
+	}
+
+	if f.After != "" {
+		where = append(where, "(t.created_at, t.id) > (SELECT created_at, id FROM threads WHERE id = ?)")
+		args = append(args, f.After)
+	}
+
+	q := "SELECT DISTINCT t.id, t.subject, t.created_at FROM " + from +
+		" WHERE " + strings.Join(where, " AND ") +
+		" ORDER BY t.created_at, t.id LIMIT ?"
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("searching threads: %w", err)
+	}
+	defer rows.Close()
+
+	var threads []*domain.Thread
+	for rows.Next() {
+		var (
+			id, subject string
+			createdAt   int64
+		)
+		if err := rows.Scan(&id, &subject, &createdAt); err != nil {
+			return nil, fmt.Errorf("searching threads: scanning thread: %w", err)
+		}
+		threads = append(threads, &domain.Thread{
+			ID:        id,
+			Subject:   subject,
+			CreatedAt: time.Unix(createdAt, 0).UTC(),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("searching threads: iterating threads: %w", err)
+	}
+
+	return threads, nil
 }
 
 // scanner is satisfied by both *sql.Row and *sql.Rows, letting scanMessage
