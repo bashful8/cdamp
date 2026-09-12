@@ -1,0 +1,18 @@
+# Build artifacts
+/cdampd
+/cdamp-mcp
+*.exe
+*.test
+
+# Local runtime state (never commit real instance data or secrets)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+cdampd.yaml
+.env
+
+# Editor/OS cruft
+.DS_Store
+*.swp
