@@ -1,0 +1,14 @@
+DROP TRIGGER IF EXISTS messages_au;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TABLE IF EXISTS messages_fts;
+DROP TABLE IF EXISTS domain_blocklist;
+DROP INDEX IF EXISTS idx_messages_pending;
+DROP INDEX IF EXISTS idx_messages_domain;
+DROP INDEX IF EXISTS idx_messages_thread;
+DROP INDEX IF EXISTS idx_messages_inbox;
+DROP INDEX IF EXISTS idx_messages_idem;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS threads;
+DROP TABLE IF EXISTS signing_keys;
+DROP TABLE IF EXISTS agents;
