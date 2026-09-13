@@ -285,6 +285,24 @@ func TestInboxStoreFakeFindAgentByTokenHash(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeFindAgentByName(t *testing.T) {
+	f := NewInboxStoreFake()
+	ctx := context.Background()
+	f.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	got, err := f.FindAgentByName(ctx, "alice")
+	if err != nil {
+		t.Fatalf("FindAgentByName: %v", err)
+	}
+	if got.ID != 1 {
+		t.Fatalf("FindAgentByName ID = %d, want 1", got.ID)
+	}
+
+	if _, err := f.FindAgentByName(ctx, "bob"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("FindAgentByName(missing) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
 func TestInboxStoreFakeListMessagesFilters(t *testing.T) {
 	f := NewInboxStoreFake()
 	ctx := context.Background()

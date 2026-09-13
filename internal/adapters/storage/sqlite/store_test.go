@@ -893,6 +893,28 @@ func TestFindAgentByTokenHashNotFound(t *testing.T) {
 	}
 }
 
+func TestFindAgentByName(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	got, err := s.FindAgentByName(ctx, "agent-1")
+	if err != nil {
+		t.Fatalf("FindAgentByName: %v", err)
+	}
+	if got.ID != 1 || got.Name != "agent-1" {
+		t.Fatalf("FindAgentByName = %+v, want ID=1 Name=agent-1", got)
+	}
+}
+
+func TestFindAgentByNameNotFound(t *testing.T) {
+	s := newTestStore(t)
+	seedAgent(t, s, 1)
+	if _, err := s.FindAgentByName(context.Background(), "no-such-agent"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("FindAgentByName(missing) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
 // seedAgent inserts a minimal agents row directly (no CreateAgent use case
 // exists yet — that's Phase 6) so messages.agent_id's foreign key is
 // satisfiable in these tests.

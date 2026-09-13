@@ -664,6 +664,25 @@ func (s *Store) FindAgentByTokenHash(ctx context.Context, tokenHash string) (*do
 	return a, nil
 }
 
+// FindAgentByName returns the agent whose name exactly matches name, or
+// domain.ErrNotFound if none matches. Added per STATUS.md's "Agent-by-name
+// lookup decision (human-resolved, 2026-09-12)" — additive to the
+// already-verified InboxStore implementation, against the agents.name
+// UNIQUE column already present in migrations/0001_init.up.sql (no
+// migration change needed).
+func (s *Store) FindAgentByName(ctx context.Context, name string) (*domain.Agent, error) {
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, name, token_hash, created_at FROM agents WHERE name = ?", name)
+	a, err := scanAgent(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("finding agent by name %q: %w", name, err)
+	}
+	return a, nil
+}
+
 // scanAgent scans one agents row (id, name, token_hash, created_at, in that
 // order) into a domain.Agent.
 func scanAgent(row scanner) (*domain.Agent, error) {

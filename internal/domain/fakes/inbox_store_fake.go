@@ -28,15 +28,21 @@ type InboxStoreFake struct {
 	// FindAgentByTokenHash — see AddAgent's doc comment. Added per
 	// STATUS.md's "Agent-lookup decision (human-resolved, 2026-09-12)".
 	agents map[int64]*domain.Agent
+	// agentsByName is a secondary index over agents, keyed by Agent.Name,
+	// for FindAgentByName — added per STATUS.md's "Agent-by-name lookup
+	// decision (human-resolved, 2026-09-12)". Kept in sync with agents by
+	// AddAgent.
+	agentsByName map[string]*domain.Agent
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
 func NewInboxStoreFake() *InboxStoreFake {
 	return &InboxStoreFake{
-		messages: map[string]*domain.Message{},
-		threads:  map[string]*domain.Thread{},
-		claimed:  map[string]bool{},
-		agents:   map[int64]*domain.Agent{},
+		messages:     map[string]*domain.Message{},
+		threads:      map[string]*domain.Thread{},
+		claimed:      map[string]bool{},
+		agents:       map[int64]*domain.Agent{},
+		agentsByName: map[string]*domain.Agent{},
 	}
 }
 
@@ -49,6 +55,7 @@ func (f *InboxStoreFake) AddAgent(a *domain.Agent) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agents[a.ID] = a
+	f.agentsByName[a.Name] = a
 }
 
 // SaveMessage stores m (and, if new, an implicit thread record keyed by
@@ -268,4 +275,18 @@ func (f *InboxStoreFake) FindAgentByTokenHash(ctx context.Context, tokenHash str
 		}
 	}
 	return nil, domain.ErrNotFound
+}
+
+// FindAgentByName returns the seeded agent whose Name exactly matches name,
+// or domain.ErrNotFound if none matches. See AddAgent. Added per
+// STATUS.md's "Agent-by-name lookup decision (human-resolved,
+// 2026-09-12)".
+func (f *InboxStoreFake) FindAgentByName(ctx context.Context, name string) (*domain.Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.agentsByName[name]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return a, nil
 }

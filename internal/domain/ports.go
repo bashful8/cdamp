@@ -37,6 +37,16 @@ type InboxStore interface {
 	// token (crypto/sha256, hex-encoded) before calling this.
 	GetAgentByID(ctx context.Context, id int64) (*Agent, error)
 	FindAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error)
+
+	// FindAgentByName resolves a local Agent by its bare agent-name (the
+	// part of an address before the "@"), added additively per STATUS.md's
+	// "Agent-by-name lookup decision (human-resolved, 2026-09-12)":
+	// ReceiveMessage needs to turn an inbound envelope's `to` address into
+	// the local recipient's Agent.ID, and neither GetAgentByID (keyed by
+	// numeric id) nor FindAgentByTokenHash (keyed by a hashed bearer token)
+	// can do that lookup. Returns ErrNotFound on a miss, consistent with
+	// every other InboxStore lookup method.
+	FindAgentByName(ctx context.Context, name string) (*Agent, error)
 }
 
 // Directory resolves an address to the data needed to deliver to it,
