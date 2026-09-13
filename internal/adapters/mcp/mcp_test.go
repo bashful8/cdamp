@@ -247,3 +247,162 @@ func TestReadMessageTool_NotFoundBecomesToolError(t *testing.T) {
 		t.Fatalf("res.IsError = false, want true (content: %+v)", res.Content)
 	}
 }
+
+func TestGetThreadTool_CallsCorrectEndpoint(t *testing.T) {
+	const token = "test-bearer-token"
+
+	var (
+		gotMethod string
+		gotPath   string
+		gotAuth   string
+	)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"thread": map[string]any{
+				"id":         "thread-1",
+				"subject":    "hello",
+				"created_at": "2026-09-13T00:00:00Z",
+			},
+			"messages": []map[string]any{
+				{
+					"id":        "msg-1",
+					"thread_id": "thread-1",
+					"agent_id":  int64(42),
+					"direction": "inbound",
+					"from":      "alice@example.com",
+					"to":        "bob@example.com",
+					"subject":   "hello",
+					"body":      "hi there",
+					"priority":  "normal",
+					"sent_at":   "2026-09-13T00:00:00Z",
+					"trust":     "verified",
+					"status":    "delivered",
+				},
+				{
+					"id":        "msg-2",
+					"thread_id": "thread-1",
+					"agent_id":  int64(42),
+					"direction": "outbound",
+					"from":      "bob@example.com",
+					"to":        "alice@example.com",
+					"subject":   "re: hello",
+					"body":      "hi back",
+					"priority":  "normal",
+					"sent_at":   "2026-09-13T00:01:00Z",
+					"trust":     "verified",
+					"status":    "sent",
+				},
+			},
+		})
+	})
+
+	session := newTestSession(t, handler, token)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "get_thread",
+		Arguments: map[string]any{
+			"id": "thread-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if gotPath != "/threads/thread-1" {
+		t.Errorf("path = %q, want /threads/thread-1", gotPath)
+	}
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+
+	thread, ok := structured["thread"].(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent[thread] is %T, want map[string]any: %+v", structured["thread"], structured["thread"])
+	}
+	if thread["id"] != "thread-1" {
+		t.Errorf("thread[id] = %v, want thread-1", thread["id"])
+	}
+	if thread["subject"] != "hello" {
+		t.Errorf("thread[subject] = %v, want hello", thread["subject"])
+	}
+
+	messages, ok := structured["messages"].([]any)
+	if !ok {
+		t.Fatalf("StructuredContent[messages] is %T, want []any: %+v", structured["messages"], structured["messages"])
+	}
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+
+	first, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("messages[0] is %T, want map[string]any: %+v", messages[0], messages[0])
+	}
+	if first["id"] != "msg-1" {
+		t.Errorf("messages[0][id] = %v, want msg-1", first["id"])
+	}
+	if first["subject"] != "hello" {
+		t.Errorf("messages[0][subject] = %v, want hello", first["subject"])
+	}
+	if first["body"] != "hi there" {
+		t.Errorf("messages[0][body] = %v, want %q", first["body"], "hi there")
+	}
+
+	for i, m := range messages {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("messages[%d] is %T, want map[string]any: %+v", i, m, m)
+		}
+		if _, present := mm["agent_id"]; present {
+			t.Errorf("messages[%d] carries an agent_id key, want it dropped", i)
+		}
+	}
+}
+
+func TestGetThreadTool_NotFoundBecomesToolError(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]string{
+				"code":    "not_found",
+				"message": "thread not found",
+			},
+		})
+	})
+
+	session := newTestSession(t, handler, "test-bearer-token")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "get_thread",
+		Arguments: map[string]any{
+			"id": "does-not-exist",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned a protocol-level error, want err == nil with res.IsError instead: %v", err)
+	}
+
+	if !res.IsError {
+		t.Fatalf("res.IsError = false, want true (content: %+v)", res.Content)
+	}
+}

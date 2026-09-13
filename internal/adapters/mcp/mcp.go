@@ -89,8 +89,53 @@ func newReadMessageHandler(c *Client) mcp.ToolHandlerFor[readMessageArgs, readMe
 	}
 }
 
-// NewServer builds the cdampd MCP server and registers send_mail and
-// read_message. The remaining three tools (list_inbox, get_thread,
+// getThreadArgs is get_thread's input, matching 03-API.md's "MCP tool
+// mapping" table signature exactly: get_thread(id).
+type getThreadArgs struct {
+	ID string `json:"id" jsonschema:"the thread id to fetch"`
+}
+
+// threadInfo is the JSON shape of GET /threads/{id}'s "thread" field,
+// mirroring internal/adapters/http/local.go's threadResponse
+// field-for-field (id, subject, created_at) -- see this task's spec in
+// STATUS.md, design decision 4. created_at is a plain string (design
+// decision 4), not time.Time.
+type threadInfo struct {
+	ID        string `json:"id"`
+	Subject   string `json:"subject"`
+	CreatedAt string `json:"created_at"`
+}
+
+// getThreadOut is get_thread's output: GET /threads/{id}'s 200 response
+// body. Messages reuses readMessageOut verbatim -- its shape (every
+// messageResponse field except agent_id, plain-string timestamps) is
+// exactly what this task wants too, and encoding/json silently drops
+// the wire's extra agent_id field when decoding into a struct that
+// lacks it. See this task's spec in STATUS.md, design decision 4.
+type getThreadOut struct {
+	Thread   threadInfo       `json:"thread"`
+	Messages []readMessageOut `json:"messages"`
+}
+
+// newGetThreadHandler returns the tool handler for get_thread, closing
+// over c. On any Client error (network failure, or a decoded REST error
+// such as a 404 not_found -- covering both "no such thread" and "thread
+// exists but caller owns none of its messages", per local.go's
+// handleGetThread), it returns the error unchanged -- same passthrough
+// pattern as newSendMailHandler/newReadMessageHandler.
+func newGetThreadHandler(c *Client) mcp.ToolHandlerFor[getThreadArgs, getThreadOut] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args getThreadArgs) (*mcp.CallToolResult, getThreadOut, error) {
+		var out getThreadOut
+		path := "/threads/" + url.PathEscape(args.ID)
+		if err := c.doJSON(ctx, "GET", path, nil, &out); err != nil {
+			return nil, getThreadOut{}, err
+		}
+		return nil, out, nil
+	}
+}
+
+// NewServer builds the cdampd MCP server and registers send_mail,
+// read_message, and get_thread. The remaining two tools (list_inbox,
 // search_threads) are explicitly out of scope for this task -- see
 // STATUS.md's "Explicitly out of scope for this task".
 func NewServer(c *Client) *mcp.Server {
@@ -103,6 +148,10 @@ func NewServer(c *Client) *mcp.Server {
 		Name:        "read_message",
 		Description: "Fetch a single CDAMP message by id.",
 	}, newReadMessageHandler(c))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "get_thread",
+		Description: "Fetch a thread's full ordered message list by thread id.",
+	}, newGetThreadHandler(c))
 	return server
 }
 
