@@ -12,7 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	"cdamp/internal/adapters/delivery"
+	"cdamp/internal/adapters/directory"
+	"cdamp/internal/adapters/signing"
+	"cdamp/internal/adapters/storage/sqlite"
 	"cdamp/internal/config"
+	"cdamp/internal/domain"
+
+	httpadapter "cdamp/internal/adapters/http"
 )
 
 // shutdownTimeout bounds how long graceful shutdown waits for in-flight
@@ -40,15 +47,48 @@ func main() {
 	}
 }
 
-// run wires the HTTP server for cfg and blocks until a shutdown signal
+// run is the composition root: it opens the SQLite store, bootstraps
+// signing, wires the directory/delivery adapters and the outbound worker,
+// builds the combined local-API + federation HTTP mux on cfg.ListenAddr
+// (03-API.md's Config section defines exactly one listen_addr — there is
+// no separate federation port), and blocks until a shutdown signal
 // (SIGINT/SIGTERM) is received, then drains connections via a bounded
-// graceful shutdown. It is the composition root's main body, split out
-// from main so it's callable/testable without invoking os.Exit.
+// graceful shutdown before closing the store. It is split out from main
+// so it's callable/testable without invoking os.Exit.
 func run(cfg *config.Config, logger *slog.Logger) error {
-	server := newServer(cfg, logger)
+	store, err := sqlite.Open(cfg.SQLitePath)
+	if err != nil {
+		return fmt.Errorf("opening sqlite store: %w", err)
+	}
+
+	// context.Background() here (not the shutdown ctx below) since this is
+	// one-time startup work, same category as config.Load itself never
+	// taking a context.
+	signer, err := signing.NewSigner(context.Background(), store, cfg.SigningKeyPassphrase)
+	if err != nil {
+		return fmt.Errorf("initializing signer: %w", err)
+	}
+
+	verifier := signing.NewVerifier()
+
+	// nil client -> NewHTTPDirectory's own documented default
+	// (&http.Client{Timeout: defaultTimeout}).
+	dir := directory.NewHTTPDirectory(nil, cfg.DirectoryCacheTTL)
+
+	deliveryClient := delivery.NewClient(signer)
+
+	worker := delivery.NewWorker(store, dir, deliveryClient, cfg.RetrySchedule)
+
+	// store satisfies both domain.InboxStore and domain.SigningKeyStore
+	// simultaneously - the same *sqlite.Store value is passed twice below,
+	// no second store instance.
+	mux := newMux(store, store, dir, verifier, cfg)
+	server := newServer(mux, cfg, logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	go worker.Run(ctx) // stops when ctx is canceled by the same shutdown signal
 
 	go func() {
 		logger.Info("http server listening", "addr", cfg.ListenAddr)
@@ -65,27 +105,47 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutting down server: %w", err)
+		// Still attempt store.Close() below even on a Shutdown error, so
+		// the database is never left open on a failed-shutdown path.
+		closeErr := store.Close()
+		return fmt.Errorf("shutting down server: %w (store close: %v)", err, closeErr)
+	}
+
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("closing sqlite store: %w", err)
 	}
 
 	logger.Info("server shut down cleanly")
 	return nil
 }
 
-// newServer builds the HTTP server for cfg: a mux serving only /healthz,
-// wrapped in the request-logging middleware.
-func newServer(cfg *config.Config, logger *slog.Logger) *http.Server {
+// newServer builds the HTTP server for cfg, serving mux under the
+// request-logging middleware.
+func newServer(mux *http.ServeMux, cfg *config.Config, logger *slog.Logger) *http.Server {
 	return &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: loggingMiddleware(logger, newMux()),
+		Handler: loggingMiddleware(logger, mux),
 	}
 }
 
-// newMux returns the HTTP routes cdampd currently serves. Only /healthz
-// exists at this phase, per 04-BUILD-PLAN.md's Phase 0 scope.
-func newMux() *http.ServeMux {
+// newMux returns cdampd's combined top-level HTTP mux: /healthz, the local
+// agent API (local.go's six bearer-auth-gated routes, mounted at the
+// catch-all "/"), and the federation surface (federation.go's three
+// unauthenticated routes, mounted at their own exact path roots so Go
+// 1.22+'s longest-pattern-wins rule routes them correctly ahead of the
+// catch-all). Both httpadapter.NewLocalMux and httpadapter.NewFederationMux
+// return fully self-contained, middleware-wrapped http.Handlers that
+// re-match the full request path internally, so no http.StripPrefix is
+// needed here.
+func newMux(store domain.InboxStore, keys domain.SigningKeyStore, dir domain.Directory, verifier domain.Verifier, cfg *config.Config) *http.ServeMux {
+	localHandler := httpadapter.NewLocalMux(store, cfg)
+	federationHandler := httpadapter.NewFederationMux(store, keys, dir, verifier, cfg)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)
+	mux.Handle("/.well-known/", federationHandler) // catches /.well-known/cdamp/{agent} and /.well-known/cdamp/keys
+	mux.Handle("/deliver", federationHandler)
+	mux.Handle("/", localHandler) // catch-all: /send, /messages, /messages/{id}, /threads, /threads/{id}, /agents/me
 	return mux
 }
 

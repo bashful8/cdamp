@@ -9,7 +9,21 @@ import (
 	"testing"
 
 	"cdamp/internal/config"
+	"cdamp/internal/domain/fakes"
 )
+
+// newTestMux builds a newMux with fresh fakes for every port, for tests
+// that only care about the combined-mux routing behavior, not any
+// particular adapter's real logic.
+func newTestMux(cfg *config.Config) *http.ServeMux {
+	return newMux(
+		fakes.NewInboxStoreFake(),
+		fakes.NewSigningKeyStoreFake(),
+		fakes.NewDirectoryFake(),
+		fakes.NewVerifierFake(),
+		cfg,
+	)
+}
 
 func TestHealthzHandler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -23,7 +37,7 @@ func TestHealthzHandler(t *testing.T) {
 }
 
 func TestNewMuxServesHealthz(t *testing.T) {
-	mux := newMux()
+	mux := newTestMux(&config.Config{Domain: "test.example"})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -34,15 +48,37 @@ func TestNewMuxServesHealthz(t *testing.T) {
 	}
 }
 
+// TestNewMuxUnknownRouteNotFound confirms the federation mux is actually
+// reachable through the combined top-level mux (not bypassed): an unknown
+// agent name at the (unauthenticated) well-known route 404s, since a bare
+// unmatched path elsewhere would instead hit the local catch-all's
+// bearer-auth middleware first and 401 (see
+// TestNewMuxUnauthenticatedLocalRouteReturns401 below), never reaching a
+// routing-level 404.
 func TestNewMuxUnknownRouteNotFound(t *testing.T) {
-	mux := newMux()
+	mux := newTestMux(&config.Config{Domain: "test.example"})
 
-	req := httptest.NewRequest(http.MethodGet, "/nope", nil)
+	req := httptest.NewRequest(http.MethodGet, "/.well-known/cdamp/nonexistent", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("GET /nope status = %d, want %d", rec.Code, http.StatusNotFound)
+		t.Errorf("GET /.well-known/cdamp/nonexistent status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestNewMuxUnauthenticatedLocalRouteReturns401 proves the local mux's
+// bearer-auth middleware is actually reachable through the top-level mux
+// (mounted at the "/" catch-all), not bypassed by the combination.
+func TestNewMuxUnauthenticatedLocalRouteReturns401(t *testing.T) {
+	mux := newTestMux(&config.Config{Domain: "test.example"})
+
+	req := httptest.NewRequest(http.MethodGet, "/messages", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated GET /messages status = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
 }
 
@@ -99,9 +135,10 @@ func TestLoggingMiddlewareDefaultsToStatusOK(t *testing.T) {
 
 func TestNewServerUsesConfiguredAddr(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil))
-	cfg := &config.Config{ListenAddr: "127.0.0.1:0"}
+	cfg := &config.Config{ListenAddr: "127.0.0.1:0", Domain: "test.example"}
+	mux := newTestMux(cfg)
 
-	srv := newServer(cfg, logger)
+	srv := newServer(mux, cfg, logger)
 	if srv.Addr != "127.0.0.1:0" {
 		t.Errorf("Addr = %q, want %q", srv.Addr, "127.0.0.1:0")
 	}
