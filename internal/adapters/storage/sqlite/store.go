@@ -683,6 +683,33 @@ func (s *Store) FindAgentByName(ctx context.Context, name string) (*domain.Agent
 	return a, nil
 }
 
+// ListAgents returns every local agent, ordered by id ascending
+// (creation order). Added additively for GET /admin/agents (Phase 6 task
+// 3) — an empty instance returns a nil slice and a nil error (zero agents
+// is a valid, non-error state), unlike GetAgentByID's per-row
+// domain.ErrNotFound semantics, which don't apply to a list endpoint.
+func (s *Store) ListAgents(ctx context.Context) ([]*domain.Agent, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT id, name, token_hash, created_at FROM agents ORDER BY id")
+	if err != nil {
+		return nil, fmt.Errorf("listing agents: %w", err)
+	}
+	defer rows.Close()
+
+	var agents []*domain.Agent
+	for rows.Next() {
+		a, err := scanAgent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("listing agents: %w", err)
+		}
+		agents = append(agents, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing agents: %w", err)
+	}
+	return agents, nil
+}
+
 // CreateAgent persists a newly created local Agent: a.Name and
 // a.TokenHash must already be set by the caller, and this call assigns
 // a.ID (via sql.Result.LastInsertId) and a.CreatedAt (set here, to the

@@ -70,6 +70,12 @@ func mapDomainError(err error) (status int, code string) {
 		return http.StatusBadRequest, "bad_request"
 	case errors.Is(err, domain.ErrNotFound):
 		return http.StatusNotFound, "not_found"
+	case errors.Is(err, domain.ErrConflict):
+		// First real caller of domain.ErrConflict over HTTP (Phase 6
+		// task 3's POST /admin/agents, a duplicate agent name) — Gap 1's
+		// own human decision already named this mapping without wiring
+		// it, since task 1 built no HTTP adapter code at all.
+		return http.StatusConflict, "conflict"
 	default:
 		// Not one of the documented sentinel errors — an unexpected
 		// failure (e.g. a store I/O error). 03-API.md's codes list has no

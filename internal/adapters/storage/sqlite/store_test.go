@@ -915,6 +915,38 @@ func TestFindAgentByNameNotFound(t *testing.T) {
 	}
 }
 
+func TestListAgents(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+	seedAgent(t, s, 2)
+
+	got, err := s.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListAgents returned %d agents, want 2", len(got))
+	}
+	if got[0].ID != 1 || got[0].Name != "agent-1" {
+		t.Errorf("ListAgents[0] = %+v, want ID=1 Name=agent-1", got[0])
+	}
+	if got[1].ID != 2 || got[1].Name != "agent-2" {
+		t.Errorf("ListAgents[1] = %+v, want ID=2 Name=agent-2", got[1])
+	}
+}
+
+func TestListAgentsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	got, err := s.ListAgents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListAgents = %v, want empty", got)
+	}
+}
+
 // seedAgent inserts a minimal agents row directly (no CreateAgent use case
 // exists yet — that's Phase 6) so messages.agent_id's foreign key is
 // satisfiable in these tests.

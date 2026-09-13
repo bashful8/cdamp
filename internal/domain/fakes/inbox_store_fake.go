@@ -294,6 +294,25 @@ func (f *InboxStoreFake) FindAgentByName(ctx context.Context, name string) (*dom
 	return a, nil
 }
 
+// ListAgents returns every seeded/created agent, ordered by ID ascending
+// (mirrors ListMessages'/SearchThreads' sort-for-determinism pattern in
+// this same file) — nil for an empty map, matching the SQLite adapter's
+// own empty-result shape. Added additively for GET /admin/agents (Phase
+// 6 task 3).
+func (f *InboxStoreFake) ListAgents(ctx context.Context) ([]*domain.Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.agents) == 0 {
+		return nil, nil
+	}
+	out := make([]*domain.Agent, 0, len(f.agents))
+	for _, a := range f.agents {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
 // CreateAgent persists a newly created local Agent: rejects a duplicate
 // a.Name with domain.ErrConflict (mirroring the sqlite adapter's
 // agents.name UNIQUE constraint), otherwise assigns a.ID (a sequential

@@ -94,6 +94,21 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	mux := newMux(store, store, dir, verifier, cfg)
 	server := newServer(mux, cfg, logger)
 
+	// The admin surface (POST/GET /admin/agents) is served on its own,
+	// independently-bound http.Server — not a route group on the mux
+	// above — since 02-ARCHITECTURE.md's Auth table says it's "bound to
+	// localhost by default", only meaningful if it's reachable at a
+	// genuinely different address than cfg.ListenAddr (which may be
+	// 0.0.0.0-bound in production for federation traffic). store
+	// satisfies both domain.InboxStore and domain.AdminStore
+	// simultaneously - the same *sqlite.Store value passed twice below,
+	// same "one concrete store, many narrow ports" pattern as above.
+	adminMux := httpadapter.NewAdminMux(store, store, cfg)
+	adminServer := &http.Server{
+		Addr:    cfg.AdminBindAddr,
+		Handler: loggingMiddleware(logger, adminMux),
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -106,6 +121,13 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
+	go func() {
+		logger.Info("admin http server listening", "addr", cfg.AdminBindAddr)
+		if err := adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("admin http server error", "error", err)
+		}
+	}()
+
 	<-ctx.Done()
 	stop()
 	logger.Info("shutdown signal received, draining connections")
@@ -113,11 +135,25 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	// Both servers are shut down before store.Close(), regardless of
+	// whether either individually fails — a failure on one must not skip
+	// attempting the other, since each is an independent listener that
+	// should be given its own chance to drain in-flight requests. Errors
+	// from both are joined (errors.Join) rather than only reporting the
+	// first, so a caller/log line can see if both failed simultaneously,
+	// not just whichever happened to be checked first — a small builder
+	// judgment call, not pinned by any doc.
+	shutdownErr := server.Shutdown(shutdownCtx)
+	adminShutdownErr := adminServer.Shutdown(shutdownCtx)
+	if shutdownErr != nil || adminShutdownErr != nil {
 		// Still attempt store.Close() below even on a Shutdown error, so
 		// the database is never left open on a failed-shutdown path.
 		closeErr := store.Close()
-		return fmt.Errorf("shutting down server: %w (store close: %v)", err, closeErr)
+		return fmt.Errorf("shutting down http servers: %w (store close: %v)",
+			errors.Join(
+				wrapNamedErr("main server", shutdownErr),
+				wrapNamedErr("admin server", adminShutdownErr),
+			), closeErr)
 	}
 
 	if err := store.Close(); err != nil {
@@ -126,6 +162,17 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	logger.Info("server shut down cleanly")
 	return nil
+}
+
+// wrapNamedErr wraps err with a name identifying which server it came
+// from, or returns nil unchanged if err is nil — used so errors.Join
+// below only aggregates the servers that actually failed to shut down,
+// each labeled with which one it was.
+func wrapNamedErr(name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", name, err)
 }
 
 // newServer builds the HTTP server for cfg, serving mux under the

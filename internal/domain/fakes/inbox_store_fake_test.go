@@ -303,6 +303,35 @@ func TestInboxStoreFakeFindAgentByName(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeListAgents(t *testing.T) {
+	f := NewInboxStoreFake()
+	ctx := context.Background()
+	f.AddAgent(&domain.Agent{ID: 2, Name: "bob", TokenHash: "hash-2"})
+	f.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	got, err := f.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListAgents returned %d agents, want 2", len(got))
+	}
+	if got[0].ID != 1 || got[1].ID != 2 {
+		t.Fatalf("ListAgents = %+v, want ordered by ID ascending", got)
+	}
+}
+
+func TestInboxStoreFakeListAgentsEmpty(t *testing.T) {
+	f := NewInboxStoreFake()
+	got, err := f.ListAgents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAgents: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListAgents = %v, want empty", got)
+	}
+}
+
 func TestInboxStoreFakeListMessagesFilters(t *testing.T) {
 	f := NewInboxStoreFake()
 	ctx := context.Background()

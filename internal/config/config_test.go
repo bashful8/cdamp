@@ -11,6 +11,7 @@ import (
 const validYAML = `
 domain: agents.example.dev
 listen_addr: ":8443"
+admin_bind_addr: "127.0.0.1:9444"
 sqlite_path: "./cdampd.db"
 signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
 rate_limit: { per_domain_rps: 5, burst: 20 }
@@ -48,6 +49,7 @@ func TestLoad_ValidFile(t *testing.T) {
 	}{
 		{"Domain", cfg.Domain, "agents.example.dev"},
 		{"ListenAddr", cfg.ListenAddr, ":8443"},
+		{"AdminBindAddr", cfg.AdminBindAddr, "127.0.0.1:9444"},
 		{"SQLitePath", cfg.SQLitePath, "./cdampd.db"},
 		{"SigningKeyPassphraseEnv", cfg.SigningKeyPassphraseEnv, "CDAMPD_KEY_PASSPHRASE"},
 		{"SigningKeyPassphrase", cfg.SigningKeyPassphrase, "hunter2"},
@@ -75,6 +77,28 @@ func TestLoad_ValidFile(t *testing.T) {
 		if cfg.RetrySchedule[i] != want {
 			t.Errorf("RetrySchedule[%d] = %v, want %v", i, cfg.RetrySchedule[i], want)
 		}
+	}
+}
+
+// minimalYAMLNoAdminBindAddr omits admin_bind_addr entirely, to exercise
+// Load's fallback-to-defaultAdminBindAddr path.
+const minimalYAMLNoAdminBindAddr = `
+domain: agents.example.dev
+listen_addr: ":8443"
+sqlite_path: "./cdampd.db"
+signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
+`
+
+func TestLoad_AdminBindAddrDefaultsWhenUnset(t *testing.T) {
+	path := writeTempConfig(t, minimalYAMLNoAdminBindAddr)
+	t.Setenv("CDAMPD_KEY_PASSPHRASE", "hunter2")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned unexpected error: %v", err)
+	}
+	if cfg.AdminBindAddr != defaultAdminBindAddr {
+		t.Errorf("AdminBindAddr = %q, want default %q", cfg.AdminBindAddr, defaultAdminBindAddr)
 	}
 }
 
@@ -109,6 +133,13 @@ func TestLoad_EnvOverridePrecedence(t *testing.T) {
 			envVal: ":9999",
 			get:    func(c *Config) any { return c.ListenAddr },
 			want:   ":9999",
+		},
+		{
+			name:   "CDAMPD_ADMIN_BIND_ADDR overrides admin_bind_addr",
+			envVar: "CDAMPD_ADMIN_BIND_ADDR",
+			envVal: "127.0.0.1:7777",
+			get:    func(c *Config) any { return c.AdminBindAddr },
+			want:   "127.0.0.1:7777",
 		},
 		{
 			name:   "CDAMPD_SQLITE_PATH overrides sqlite_path",

@@ -48,6 +48,15 @@ type InboxStore interface {
 	// every other InboxStore lookup method.
 	FindAgentByName(ctx context.Context, name string) (*Agent, error)
 
+	// ListAgents returns every local Agent registered with this instance,
+	// ordered by ID ascending (creation order) for deterministic pagination-
+	// free listing — 03-API.md's GET /admin/agents returns the full set with
+	// no filter/paging params documented, so no MessageFilter/ThreadFilter-
+	// style parameter is needed here. Added additively for GET /admin/agents
+	// (Phase 6 task 3), the same established pattern as GetAgentByID/
+	// FindAgentByTokenHash/FindAgentByName.
+	ListAgents(ctx context.Context) ([]*Agent, error)
+
 	// CreateAgent persists a newly created local Agent. a.Name and
 	// a.TokenHash must already be set by the caller (internal/app's
 	// CreateAgent use case generates the plaintext token and hashes it —

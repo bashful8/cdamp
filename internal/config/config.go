@@ -16,9 +16,10 @@ import (
 // passphrase resolved from the environment variable it names. There is no
 // config service and no hot reload — a config change requires a restart.
 type Config struct {
-	Domain     string `yaml:"domain"`
-	ListenAddr string `yaml:"listen_addr"`
-	SQLitePath string `yaml:"sqlite_path"`
+	Domain        string `yaml:"domain"`
+	ListenAddr    string `yaml:"listen_addr"`
+	AdminBindAddr string `yaml:"admin_bind_addr"`
+	SQLitePath    string `yaml:"sqlite_path"`
 
 	// SigningKeyPassphraseEnv names the environment variable that holds
 	// the signing-key passphrase. The passphrase itself is never stored
@@ -54,6 +55,7 @@ type Config struct {
 type rawConfig struct {
 	Domain                  string `yaml:"domain"`
 	ListenAddr              string `yaml:"listen_addr"`
+	AdminBindAddr           string `yaml:"admin_bind_addr"`
 	SQLitePath              string `yaml:"sqlite_path"`
 	SigningKeyPassphraseEnv string `yaml:"signing_key_passphrase_env"`
 
@@ -84,6 +86,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 
 	c.Domain = raw.Domain
 	c.ListenAddr = raw.ListenAddr
+	c.AdminBindAddr = raw.AdminBindAddr
 	c.SQLitePath = raw.SQLitePath
 	c.SigningKeyPassphraseEnv = raw.SigningKeyPassphraseEnv
 	c.RateLimit.PerDomainRPS = raw.RateLimit.PerDomainRPS
@@ -139,6 +142,15 @@ func parseDurations(field string, ss []string) ([]time.Duration, error) {
 	return out, nil
 }
 
+// defaultAdminBindAddr is used when admin_bind_addr is left unset in the
+// YAML file and no CDAMPD_ADMIN_BIND_ADDR override is given — implements
+// the Gap 2 decision's "defaulting to 127.0.0.1:<port>" literally. Not
+// derived from ListenAddr's own port: two http.Servers cannot share one
+// bind address, so this must be a distinct, fixed port, not a formula.
+// Not pinned by any doc — a builder judgment call in the same low-risk
+// category as tokenBytes/shutdownTimeout/adminCookieName.
+const defaultAdminBindAddr = "127.0.0.1:8444"
+
 // Load reads the YAML config file at path, applies CDAMPD_*-style
 // environment variable overrides on top of it, then resolves the
 // signing-key passphrase from the environment variable named by
@@ -157,6 +169,10 @@ func Load(path string) (*Config, error) {
 
 	if err := applyEnvOverrides(&cfg); err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
+	}
+
+	if cfg.AdminBindAddr == "" {
+		cfg.AdminBindAddr = defaultAdminBindAddr
 	}
 
 	// Never stored in the YAML file itself: resolved from whichever env
@@ -181,6 +197,9 @@ func applyEnvOverrides(cfg *Config) error {
 	}
 	if v, ok := lookupEnv("CDAMPD_LISTEN_ADDR"); ok {
 		cfg.ListenAddr = v
+	}
+	if v, ok := lookupEnv("CDAMPD_ADMIN_BIND_ADDR"); ok {
+		cfg.AdminBindAddr = v
 	}
 	if v, ok := lookupEnv("CDAMPD_SQLITE_PATH"); ok {
 		cfg.SQLitePath = v
