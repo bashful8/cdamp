@@ -3,9 +3,12 @@ package web
 import (
 	"context"
 	"embed"
+	"errors"
 	"html/template"
 	"io/fs"
 	"net/http"
+	"strconv"
+	"time"
 
 	"cdamp/internal/app"
 	"cdamp/internal/config"
@@ -34,6 +37,7 @@ var pages = template.Must(template.ParseFS(templateFS, "templates/*.html"))
 func NewDashboardHandler(store domain.InboxStore, cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /dashboard/", handleDashboardHome(store, cfg))
+	mux.HandleFunc("GET /dashboard/agents/{id}", handleDashboardAgentInbox(store, cfg))
 	mux.Handle("GET /dashboard/static/", http.StripPrefix("/dashboard/static/", http.FileServerFS(mustSub(templateFS, "templates/static"))))
 	return mux
 }
@@ -55,8 +59,20 @@ func mustSub(fsys fs.FS, dir string) fs.FS {
 // computed via app.ListMessages (see spec's "Unread count" design
 // decision for why there's no dedicated count port method yet).
 type agentRow struct {
+	ID      int64
 	Address string
 	Unread  int
+}
+
+// messageRow is the per-message view-model handleDashboardAgentInbox's
+// template renders — a small, page-specific projection of domain.Message,
+// not messageResponse (that's the JSON API's shape, internal/adapters/http
+// only).
+type messageRow struct {
+	From    string
+	Subject string
+	SentAt  time.Time
+	Read    bool
 }
 
 func handleDashboardHome(store domain.InboxStore, cfg *config.Config) http.HandlerFunc {
@@ -74,7 +90,7 @@ func handleDashboardHome(store domain.InboxStore, cfg *config.Config) http.Handl
 				http.Error(w, "failed to count unread messages", http.StatusInternalServerError)
 				return
 			}
-			rows = append(rows, agentRow{Address: a.Name + "@" + cfg.Domain, Unread: unread})
+			rows = append(rows, agentRow{ID: a.ID, Address: a.Name + "@" + cfg.Domain, Unread: unread})
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -94,4 +110,50 @@ func unreadCount(ctx context.Context, store domain.InboxStore, agentID int64) (i
 		return 0, err
 	}
 	return len(result.Messages), nil
+}
+
+// handleDashboardAgentInbox implements GET /dashboard/agents/{id}: one
+// agent's message list (first page only, no unread filter — see this
+// task's "Design decisions" for the scope cut). A malformed id or a
+// domain.ErrNotFound from GetAgentByID both render 404; any other error
+// is a genuine failure, rendered 500 — mirrors handleDashboardHome's own
+// error-to-status mapping exactly.
+func handleDashboardAgentInbox(store domain.InboxStore, cfg *config.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil {
+			http.Error(w, "agent not found", http.StatusNotFound)
+			return
+		}
+
+		agent, err := store.GetAgentByID(r.Context(), id)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				http.Error(w, "agent not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "failed to look up agent", http.StatusInternalServerError)
+			return
+		}
+
+		result, err := app.ListMessages(r.Context(), store, domain.MessageFilter{AgentID: id, Limit: 50})
+		if err != nil {
+			http.Error(w, "failed to list messages", http.StatusInternalServerError)
+			return
+		}
+
+		rows := make([]messageRow, 0, len(result.Messages))
+		for _, m := range result.Messages {
+			rows = append(rows, messageRow{From: m.From, Subject: m.Subject, SentAt: m.SentAt, Read: m.Read})
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		data := struct {
+			Address  string
+			Messages []messageRow
+		}{Address: agent.Name + "@" + cfg.Domain, Messages: rows}
+		if err := pages.ExecuteTemplate(w, "agent_inbox.html", data); err != nil {
+			http.Error(w, "failed to render", http.StatusInternalServerError)
+		}
+	}
 }

@@ -44,6 +44,14 @@ type InboxStoreFake struct {
 	// ListAgents fail, and internal/adapters/web's
 	// TestDashboardHomeStoreErrorReturns500 needs to.
 	listAgentsErr error
+	// listMessagesErr, when set via SetListMessagesErr, makes ListMessages
+	// return this error instead of its normal result — mirrors
+	// listAgentsErr/SetListAgentsErr's exact shape, added per STATUS.md's
+	// Phase 6 task 6 spec "Design decisions" #5: nothing else on
+	// InboxStoreFake lets a test make ListMessages fail, and
+	// internal/adapters/web's TestDashboardAgentInboxListMessagesErrorReturns500
+	// needs to.
+	listMessagesErr error
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
@@ -96,10 +104,24 @@ func (f *InboxStoreFake) GetMessage(ctx context.Context, id string) (*domain.Mes
 	return m, nil
 }
 
+// SetListMessagesErr makes every subsequent ListMessages call return err
+// instead of its normal result — mirrors SetListAgentsErr/listAgentsErr's
+// exact shape, used to test callers' handling of a real ListMessages
+// failure (e.g. internal/adapters/web's per-agent inbox handler mapping
+// it to a 500).
+func (f *InboxStoreFake) SetListMessagesErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listMessagesErr = err
+}
+
 // ListMessages returns messages matching f, ordered by ID for determinism.
 func (f *InboxStoreFake) ListMessages(ctx context.Context, filter domain.MessageFilter) ([]*domain.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listMessagesErr != nil {
+		return nil, f.listMessagesErr
+	}
 
 	var out []*domain.Message
 	for _, m := range f.messages {

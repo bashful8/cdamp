@@ -345,6 +345,21 @@ func TestInboxStoreFakeListAgentsEmpty(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeListMessagesForcedErr(t *testing.T) {
+	f := NewInboxStoreFake()
+	if err := f.SaveMessage(context.Background(), &domain.Message{ID: "m1", AgentID: 1}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	boom := errors.New("boom")
+	f.SetListMessagesErr(boom)
+
+	_, err := f.ListMessages(context.Background(), domain.MessageFilter{AgentID: 1})
+	if !errors.Is(err, boom) {
+		t.Fatalf("ListMessages error = %v, want %v", err, boom)
+	}
+}
+
 func TestInboxStoreFakeListMessagesFilters(t *testing.T) {
 	f := NewInboxStoreFake()
 	ctx := context.Background()
