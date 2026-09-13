@@ -64,3 +64,21 @@ type Verifier interface {
 type Delivery interface {
 	Deliver(ctx context.Context, m *Message, inboxURL string) error
 }
+
+// SigningKeyStore persists and retrieves the local domain's Ed25519
+// signing key lifecycle (bootstrap, active/previous lookup, retirement).
+// Added additively per STATUS.md's "Signing-key port decision
+// (human-resolved, 2026-09-12)": signing-key lifecycle is a genuinely
+// separate concern from messages/threads/agents, so it gets its own port
+// rather than folding onto InboxStore, whose own doc comment scopes it to
+// "messages, threads, and the outbound retry queue". *sqlite.Store already
+// implements this exact shape (internal/adapters/storage/sqlite/keys.go,
+// verified in Phase 2) — this is a pure interface declaration, no new
+// adapter code. passphrase is a plain string, carrying forward keys.go's
+// own already-approved Phase 2 shape rather than introducing a new one.
+type SigningKeyStore interface {
+	SaveSigningKey(ctx context.Context, key *SigningKey, passphrase string) error
+	GetActiveSigningKey(ctx context.Context, passphrase string) (*SigningKey, error)
+	GetPreviousSigningKey(ctx context.Context, passphrase string) (*SigningKey, error)
+	RetireSigningKey(ctx context.Context, kid string, retireAt time.Time) error
+}
