@@ -22,6 +22,7 @@ import (
 	"cdamp/internal/domain"
 
 	httpadapter "cdamp/internal/adapters/http"
+	mcpadapter "cdamp/internal/adapters/mcp"
 )
 
 // shutdownTimeout bounds how long graceful shutdown waits for in-flight
@@ -30,6 +31,14 @@ import (
 const shutdownTimeout = 5 * time.Second
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		if err := runMCPMode(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "cdampd mcp: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	configPath := flag.String("config", "cdampd.yaml", "path to the cdampd YAML config file")
 	flag.Parse()
 
@@ -171,6 +180,29 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	logger.Info("server shut down cleanly")
 	return nil
+}
+
+// runMCPMode parses the "mcp" subcommand's own flags and runs cdampd as
+// an MCP server over stdio (03-API.md's MCP tool mapping; binary-layout
+// decision in STATUS.md's "MCP library decision"). It never opens the
+// SQLite store or touches cfg.ListenAddr/AdminBindAddr -- it only speaks
+// to an already-running cdampd's local agent API over HTTP, exactly like
+// any other bearer-token caller of that API.
+func runMCPMode(args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	apiBaseURL := fs.String("api-base-url", "http://127.0.0.1:8443", "base URL of the running cdampd instance's local agent API")
+	token := fs.String("token", "", "this agent's bearer token (required)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *token == "" {
+		return fmt.Errorf("-token is required")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return mcpadapter.Run(ctx, *apiBaseURL, *token)
 }
 
 // wrapNamedErr wraps err with a name identifying which server it came
