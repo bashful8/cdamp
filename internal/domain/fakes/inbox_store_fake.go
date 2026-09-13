@@ -24,6 +24,10 @@ type InboxStoreFake struct {
 	// ClaimPending and not yet marked delivered/failed, so a second
 	// ClaimPending call never double-claims a row still in flight.
 	claimed map[string]bool
+	// agents holds seeded agents, keyed by ID, for GetAgentByID/
+	// FindAgentByTokenHash — see AddAgent's doc comment. Added per
+	// STATUS.md's "Agent-lookup decision (human-resolved, 2026-09-12)".
+	agents map[int64]*domain.Agent
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
@@ -32,7 +36,19 @@ func NewInboxStoreFake() *InboxStoreFake {
 		messages: map[string]*domain.Message{},
 		threads:  map[string]*domain.Thread{},
 		claimed:  map[string]bool{},
+		agents:   map[int64]*domain.Agent{},
 	}
+}
+
+// AddAgent seeds the fake with an agent, keyed by its ID, so tests can set
+// up GetAgentByID/FindAgentByTokenHash lookups the same way other tests
+// seed messages/threads via SaveMessage — the go-hexagonal-style skill's
+// "hand-written fake" pattern, applied to the agents Task 2 additively
+// requires. Overwrites any existing agent with the same ID.
+func (f *InboxStoreFake) AddAgent(a *domain.Agent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agents[a.ID] = a
 }
 
 // SaveMessage stores m (and, if new, an implicit thread record keyed by
@@ -221,6 +237,34 @@ func (f *InboxStoreFake) FindByIdempotencyKey(ctx context.Context, key string) (
 	for _, m := range f.messages {
 		if m.IdempotencyKey == key {
 			return m, nil
+		}
+	}
+	return nil, domain.ErrNotFound
+}
+
+// GetAgentByID returns the seeded agent with the given id, or
+// domain.ErrNotFound if none exists. See AddAgent.
+func (f *InboxStoreFake) GetAgentByID(ctx context.Context, id int64) (*domain.Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.agents[id]
+	if !ok {
+		return nil, domain.ErrNotFound
+	}
+	return a, nil
+}
+
+// FindAgentByTokenHash returns the seeded agent whose TokenHash exactly
+// matches tokenHash, or domain.ErrNotFound if none matches. See AddAgent.
+func (f *InboxStoreFake) FindAgentByTokenHash(ctx context.Context, tokenHash string) (*domain.Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if tokenHash == "" {
+		return nil, domain.ErrNotFound
+	}
+	for _, a := range f.agents {
+		if a.TokenHash == tokenHash {
+			return a, nil
 		}
 	}
 	return nil, domain.ErrNotFound

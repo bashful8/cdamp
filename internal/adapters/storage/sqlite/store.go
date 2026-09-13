@@ -626,6 +626,58 @@ func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, 
 	return threads, nil
 }
 
+// GetAgentByID returns the agent with the given id, or domain.ErrNotFound
+// if no such agent exists. Added per STATUS.md's "Agent-lookup decision
+// (human-resolved, 2026-09-12)" — additive to the already-verified
+// InboxStore implementation, against the agents table already present in
+// migrations/0001_init.up.sql (no migration change needed).
+func (s *Store) GetAgentByID(ctx context.Context, id int64) (*domain.Agent, error) {
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, name, token_hash, created_at FROM agents WHERE id = ?", id)
+	a, err := scanAgent(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("getting agent %d: %w", id, err)
+	}
+	return a, nil
+}
+
+// FindAgentByTokenHash returns the agent whose stored token_hash exactly
+// matches tokenHash, or domain.ErrNotFound if none matches. tokenHash must
+// already be the hex-encoded SHA-256 digest of the raw bearer token (per
+// STATUS.md's "Agent-lookup decision" — the same deterministic hash a
+// future CreateAgent (Phase 6) would write into token_hash at creation
+// time), so this is a plain exact-match lookup, not a hashing operation
+// itself.
+func (s *Store) FindAgentByTokenHash(ctx context.Context, tokenHash string) (*domain.Agent, error) {
+	row := s.db.QueryRowContext(ctx,
+		"SELECT id, name, token_hash, created_at FROM agents WHERE token_hash = ?", tokenHash)
+	a, err := scanAgent(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+		return nil, fmt.Errorf("finding agent by token hash: %w", err)
+	}
+	return a, nil
+}
+
+// scanAgent scans one agents row (id, name, token_hash, created_at, in that
+// order) into a domain.Agent.
+func scanAgent(row scanner) (*domain.Agent, error) {
+	var (
+		a         domain.Agent
+		createdAt int64
+	)
+	if err := row.Scan(&a.ID, &a.Name, &a.TokenHash, &createdAt); err != nil {
+		return nil, err
+	}
+	a.CreatedAt = time.Unix(createdAt, 0).UTC()
+	return &a, nil
+}
+
 // scanner is satisfied by both *sql.Row and *sql.Rows, letting scanMessage
 // serve GetMessage (single row) and GetThread/ListMessages (multi-row)
 // alike.

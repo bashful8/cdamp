@@ -246,6 +246,45 @@ func TestInboxStoreFakeMarkFailedReleasesClaimForRetry(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeGetAgentByID(t *testing.T) {
+	f := NewInboxStoreFake()
+	ctx := context.Background()
+	f.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	got, err := f.GetAgentByID(ctx, 1)
+	if err != nil {
+		t.Fatalf("GetAgentByID: %v", err)
+	}
+	if got.Name != "alice" {
+		t.Fatalf("GetAgentByID Name = %q, want alice", got.Name)
+	}
+
+	if _, err := f.GetAgentByID(ctx, 2); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("GetAgentByID(missing) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
+func TestInboxStoreFakeFindAgentByTokenHash(t *testing.T) {
+	f := NewInboxStoreFake()
+	ctx := context.Background()
+	f.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	got, err := f.FindAgentByTokenHash(ctx, "hash-1")
+	if err != nil {
+		t.Fatalf("FindAgentByTokenHash: %v", err)
+	}
+	if got.ID != 1 {
+		t.Fatalf("FindAgentByTokenHash ID = %d, want 1", got.ID)
+	}
+
+	if _, err := f.FindAgentByTokenHash(ctx, "wrong-hash"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("FindAgentByTokenHash(wrong) error = %v, want domain.ErrNotFound", err)
+	}
+	if _, err := f.FindAgentByTokenHash(ctx, ""); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("FindAgentByTokenHash(\"\") error = %v, want domain.ErrNotFound", err)
+	}
+}
+
 func TestInboxStoreFakeListMessagesFilters(t *testing.T) {
 	f := NewInboxStoreFake()
 	ctx := context.Background()

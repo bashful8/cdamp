@@ -24,6 +24,19 @@ type InboxStore interface {
 	MarkFailed(ctx context.Context, id string, nextAttempt *time.Time, reason string) error
 
 	FindByIdempotencyKey(ctx context.Context, key string) (*Message, error)
+
+	// GetAgentByID and FindAgentByTokenHash resolve a local Agent record —
+	// added additively per STATUS.md's "Agent-lookup decision
+	// (human-resolved, 2026-09-12)": 02-ARCHITECTURE.md's SendMessage flow
+	// requires resolving a bearer token to a domain.Agent, but neither this
+	// interface nor a separate port anywhere provided a way to do that
+	// lookup. Both return ErrNotFound on a miss, consistent with every
+	// other InboxStore method. FindAgentByTokenHash takes an already-hashed
+	// token (see the go-hexagonal-style skill: ports never take
+	// adapter-specific or raw-secret types) — callers hash the raw bearer
+	// token (crypto/sha256, hex-encoded) before calling this.
+	GetAgentByID(ctx context.Context, id int64) (*Agent, error)
+	FindAgentByTokenHash(ctx context.Context, tokenHash string) (*Agent, error)
 }
 
 // Directory resolves an address to the data needed to deliver to it,

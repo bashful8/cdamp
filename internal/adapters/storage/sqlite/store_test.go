@@ -845,6 +845,54 @@ func TestSearchThreadsFTSMatching(t *testing.T) {
 	})
 }
 
+func TestGetAgentByID(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	got, err := s.GetAgentByID(ctx, 1)
+	if err != nil {
+		t.Fatalf("GetAgentByID: %v", err)
+	}
+	if got.ID != 1 || got.Name != "agent-1" {
+		t.Fatalf("GetAgentByID = %+v, want ID=1 Name=agent-1", got)
+	}
+}
+
+func TestGetAgentByIDNotFound(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.GetAgentByID(context.Background(), 999); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("GetAgentByID(missing) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
+func TestFindAgentByTokenHash(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.db.Exec(
+		"INSERT INTO agents (id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
+		1, "alice", "deadbeef", time.Now().Unix(),
+	); err != nil {
+		t.Fatalf("seeding agent: %v", err)
+	}
+
+	got, err := s.FindAgentByTokenHash(ctx, "deadbeef")
+	if err != nil {
+		t.Fatalf("FindAgentByTokenHash: %v", err)
+	}
+	if got.ID != 1 || got.Name != "alice" {
+		t.Fatalf("FindAgentByTokenHash = %+v, want ID=1 Name=alice", got)
+	}
+}
+
+func TestFindAgentByTokenHashNotFound(t *testing.T) {
+	s := newTestStore(t)
+	seedAgent(t, s, 1)
+	if _, err := s.FindAgentByTokenHash(context.Background(), "no-such-hash"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("FindAgentByTokenHash(wrong) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
 // seedAgent inserts a minimal agents row directly (no CreateAgent use case
 // exists yet — that's Phase 6) so messages.agent_id's foreign key is
 // satisfiable in these tests.
