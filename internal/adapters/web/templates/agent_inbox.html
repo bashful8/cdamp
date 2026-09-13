@@ -3,6 +3,6 @@
 <p><a href="/dashboard/">&larr; All agents</a></p>
 <table>
 <tr><th>From</th><th>Subject</th><th>Sent</th><th>Read</th></tr>
-{{range .Messages}}<tr><td>{{.From}}</td><td>{{.Subject}}</td><td>{{.SentAt}}</td><td>{{.Read}}</td></tr>{{end}}
+{{range .Messages}}<tr><td>{{.From}}</td><td><a href="/dashboard/threads/{{.ThreadID}}">{{.Subject}}</a></td><td>{{.SentAt}}</td><td>{{.Read}}</td></tr>{{end}}
 </table>
 {{template "layout-foot" .}}{{end}}

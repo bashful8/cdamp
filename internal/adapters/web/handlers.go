@@ -38,6 +38,7 @@ func NewDashboardHandler(store domain.InboxStore, cfg *config.Config) http.Handl
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /dashboard/", handleDashboardHome(store, cfg))
 	mux.HandleFunc("GET /dashboard/agents/{id}", handleDashboardAgentInbox(store, cfg))
+	mux.HandleFunc("GET /dashboard/threads/{id}", handleDashboardThread(store))
 	mux.Handle("GET /dashboard/static/", http.StripPrefix("/dashboard/static/", http.FileServerFS(mustSub(templateFS, "templates/static"))))
 	return mux
 }
@@ -69,10 +70,23 @@ type agentRow struct {
 // not messageResponse (that's the JSON API's shape, internal/adapters/http
 // only).
 type messageRow struct {
-	From    string
-	Subject string
-	SentAt  time.Time
-	Read    bool
+	ThreadID string
+	From     string
+	Subject  string
+	SentAt   time.Time
+	Read     bool
+}
+
+// messageDetailRow is the per-message view-model handleDashboardThread's
+// template renders — like messageRow but also carries To and Body, since
+// the thread view is exactly the "full message body" surface task 6's
+// spec deferred to this task.
+type messageDetailRow struct {
+	From, To string
+	Subject  string
+	Body     string
+	SentAt   time.Time
+	Read     bool
 }
 
 func handleDashboardHome(store domain.InboxStore, cfg *config.Config) http.HandlerFunc {
@@ -144,7 +158,7 @@ func handleDashboardAgentInbox(store domain.InboxStore, cfg *config.Config) http
 
 		rows := make([]messageRow, 0, len(result.Messages))
 		for _, m := range result.Messages {
-			rows = append(rows, messageRow{From: m.From, Subject: m.Subject, SentAt: m.SentAt, Read: m.Read})
+			rows = append(rows, messageRow{ThreadID: m.ThreadID, From: m.From, Subject: m.Subject, SentAt: m.SentAt, Read: m.Read})
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -153,6 +167,45 @@ func handleDashboardAgentInbox(store domain.InboxStore, cfg *config.Config) http
 			Messages []messageRow
 		}{Address: agent.Name + "@" + cfg.Domain, Messages: rows}
 		if err := pages.ExecuteTemplate(w, "agent_inbox.html", data); err != nil {
+			http.Error(w, "failed to render", http.StatusInternalServerError)
+		}
+	}
+}
+
+// handleDashboardThread implements GET /dashboard/threads/{id}: one
+// thread's subject plus every message filed under it, bodies included
+// (03-API.md: "full ordered conversation, all message bodies, one call,
+// no pagination needed"). domain.ErrNotFound (unknown thread id) renders
+// 404; any other error is a genuine failure, rendered 500 — mirrors
+// handleDashboardAgentInbox's own error-to-status mapping. No ownership
+// check: see this task's "Design decisions" #2 for why that's correct
+// here, unlike internal/adapters/http/local.go's agent-facing GET
+// /threads/{id}.
+func handleDashboardThread(store domain.InboxStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+
+		result, err := app.GetThread(r.Context(), store, id)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				http.Error(w, "thread not found", http.StatusNotFound)
+				return
+			}
+			http.Error(w, "failed to look up thread", http.StatusInternalServerError)
+			return
+		}
+
+		rows := make([]messageDetailRow, 0, len(result.Messages))
+		for _, m := range result.Messages {
+			rows = append(rows, messageDetailRow{From: m.From, To: m.To, Subject: m.Subject, Body: m.Body, SentAt: m.SentAt, Read: m.Read})
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		data := struct {
+			Subject  string
+			Messages []messageDetailRow
+		}{Subject: result.Thread.Subject, Messages: rows}
+		if err := pages.ExecuteTemplate(w, "thread.html", data); err != nil {
 			http.Error(w, "failed to render", http.StatusInternalServerError)
 		}
 	}

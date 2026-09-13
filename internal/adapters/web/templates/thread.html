@@ -1,0 +1,5 @@
+{{define "thread.html"}}{{template "layout-head" .}}
+<h1>Thread — {{.Subject}}</h1>
+<p><a href="/dashboard/">&larr; All agents</a></p>
+{{range .Messages}}<div><p><strong>{{.From}}</strong> &rarr; {{.To}} ({{.SentAt}}) {{if not .Read}}[unread]{{end}}</p><p>{{.Subject}}</p><pre>{{.Body}}</pre></div>{{end}}
+{{template "layout-foot" .}}{{end}}

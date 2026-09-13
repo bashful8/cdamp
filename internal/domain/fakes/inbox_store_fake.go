@@ -52,6 +52,14 @@ type InboxStoreFake struct {
 	// internal/adapters/web's TestDashboardAgentInboxListMessagesErrorReturns500
 	// needs to.
 	listMessagesErr error
+	// getThreadErr, when set via SetGetThreadErr, makes GetThread return
+	// this error instead of its normal result — mirrors listMessagesErr/
+	// SetListMessagesErr's exact shape, added per STATUS.md's Phase 6
+	// task 7 spec "Design decisions" #6: nothing else on InboxStoreFake
+	// lets a test make GetThread fail for a reason other than
+	// domain.ErrNotFound, and internal/adapters/web's
+	// TestDashboardThreadGetThreadErrorReturns500 needs to.
+	getThreadErr error
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
@@ -149,12 +157,25 @@ func (f *InboxStoreFake) ListMessages(ctx context.Context, filter domain.Message
 	return out, nil
 }
 
+// SetGetThreadErr makes every subsequent GetThread call return err instead
+// of its normal result — mirrors SetListMessagesErr/listMessagesErr's exact
+// shape, used to test callers' handling of a real GetThread failure (e.g.
+// internal/adapters/web's thread-view handler mapping it to a 500).
+func (f *InboxStoreFake) SetGetThreadErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.getThreadErr = err
+}
+
 // GetThread returns the thread with the given id and every message filed
 // under it (ordered by ID), or domain.ErrNotFound if the thread doesn't
 // exist.
 func (f *InboxStoreFake) GetThread(ctx context.Context, id string) (*domain.Thread, []*domain.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.getThreadErr != nil {
+		return nil, nil, f.getThreadErr
+	}
 	t, ok := f.threads[id]
 	if !ok {
 		return nil, nil, domain.ErrNotFound

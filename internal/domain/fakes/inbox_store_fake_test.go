@@ -360,6 +360,21 @@ func TestInboxStoreFakeListMessagesForcedErr(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeGetThreadForcedErr(t *testing.T) {
+	f := NewInboxStoreFake()
+	if err := f.SaveMessage(context.Background(), &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1"}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	boom := errors.New("boom")
+	f.SetGetThreadErr(boom)
+
+	_, _, err := f.GetThread(context.Background(), "t1")
+	if !errors.Is(err, boom) {
+		t.Fatalf("GetThread error = %v, want %v", err, boom)
+	}
+}
+
 func TestInboxStoreFakeListMessagesFilters(t *testing.T) {
 	f := NewInboxStoreFake()
 	ctx := context.Background()

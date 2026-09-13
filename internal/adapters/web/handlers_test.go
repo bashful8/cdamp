@@ -194,3 +194,94 @@ func TestDashboardAgentInboxListMessagesErrorReturns500(t *testing.T) {
 		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
 	}
 }
+
+func TestDashboardAgentInboxLinksToThread(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", From: "bob@example.dev", Subject: "hello", Read: false}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/agents/1", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/dashboard/threads/t1"`) {
+		t.Errorf("body missing link to thread:\n%s", body)
+	}
+}
+
+func TestDashboardThreadShowsMessages(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", From: "bob@example.dev", To: "alice@example.dev", Subject: "hello", Body: "first message body", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m2", AgentID: 1, ThreadID: "t1", From: "alice@example.dev", To: "bob@example.dev", Subject: "re: hello", Body: "second message body", Read: false}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/threads/t1", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "hello") {
+		t.Errorf("body missing thread subject in heading:\n%s", body)
+	}
+	if !strings.Contains(body, "bob@example.dev") || !strings.Contains(body, "alice@example.dev") {
+		t.Errorf("body missing From/To addresses:\n%s", body)
+	}
+	if !strings.Contains(body, "first message body") || !strings.Contains(body, "second message body") {
+		t.Errorf("body missing message bodies:\n%s", body)
+	}
+}
+
+func TestDashboardThreadUnknownIDReturns404(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/threads/does-not-exist", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 404 {
+		t.Fatalf("status = %d, want 404 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDashboardThreadGetThreadErrorReturns500(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", Subject: "hello"}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+	store.SetGetThreadErr(errors.New("boom"))
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/threads/t1", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 500 {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
