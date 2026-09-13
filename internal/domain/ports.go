@@ -102,3 +102,33 @@ type SigningKeyStore interface {
 	GetPreviousSigningKey(ctx context.Context, passphrase string) (*SigningKey, error)
 	RetireSigningKey(ctx context.Context, kid string, retireAt time.Time) error
 }
+
+// AdminStore persists the single bootstrap admin credential that
+// authenticates dashboard/admin-API sessions. Added additively per
+// STATUS.md's "Gap 2 decision — admin session auth (human-resolved,
+// 2026-09-13)": kept as its own narrow port rather than folded onto
+// InboxStore, mirroring SigningKeyStore's own precedent and stated
+// rationale — an admin credential authenticates a human operating the
+// dashboard, not an agent sending/receiving mail, one of
+// 02-ARCHITECTURE.md's Auth table's three explicitly "never conflated"
+// mechanisms. Exactly one row ever exists per instance — enforced at the
+// schema level (0002_admin.up.sql's CHECK(id = 1)), not by this
+// interface.
+type AdminStore interface {
+	// GetAdminCredential returns the singleton admin credential, or
+	// ErrNotFound if none has been bootstrapped yet — mirrors
+	// SigningKeyStore.GetActiveSigningKey's ErrNotFound-on-empty-table
+	// contract exactly, so BootstrapAdminCredential (internal/app) can
+	// tell "needs bootstrapping" apart from a real error the same way
+	// signing.NewSigner already does.
+	GetAdminCredential(ctx context.Context) (*AdminCredential, error)
+
+	// SaveAdminCredential persists c as the singleton admin credential.
+	// Called at most once per instance lifetime, by
+	// BootstrapAdminCredential, only after GetAdminCredential has
+	// reported ErrNotFound — enforcing that ordering is the caller's
+	// job, not this method's (a second call in violation of that
+	// ordering fails closed on the schema's own id=1 PRIMARY KEY, not
+	// via any in-application check here).
+	SaveAdminCredential(ctx context.Context, c *AdminCredential) error
+}

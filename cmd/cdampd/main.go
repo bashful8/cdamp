@@ -16,6 +16,7 @@ import (
 	"cdamp/internal/adapters/directory"
 	"cdamp/internal/adapters/signing"
 	"cdamp/internal/adapters/storage/sqlite"
+	"cdamp/internal/app"
 	"cdamp/internal/config"
 	"cdamp/internal/domain"
 
@@ -67,6 +68,14 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	signer, err := signing.NewSigner(context.Background(), store, cfg.SigningKeyPassphrase)
 	if err != nil {
 		return fmt.Errorf("initializing signer: %w", err)
+	}
+
+	adminToken, created, err := app.BootstrapAdminCredential(context.Background(), store)
+	if err != nil {
+		return fmt.Errorf("bootstrapping admin credential: %w", err)
+	}
+	if created {
+		fmt.Println("cdampd: admin bootstrap credential (printed once, never shown again):", adminToken)
 	}
 
 	verifier := signing.NewVerifier()
