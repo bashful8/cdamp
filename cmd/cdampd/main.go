@@ -75,7 +75,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	// (&http.Client{Timeout: defaultTimeout}).
 	dir := directory.NewHTTPDirectory(nil, cfg.DirectoryCacheTTL)
 
-	deliveryClient := delivery.NewClient(signer)
+	deliveryClient := delivery.NewClient(signer, nil)
 
 	worker := delivery.NewWorker(store, dir, deliveryClient, cfg.RetrySchedule)
 

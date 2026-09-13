@@ -63,7 +63,7 @@ func TestDeliver_HappyPath_FieldRoundTrip(t *testing.T) {
 	defer srv.Close()
 
 	signer := fakes.NewSignerFake("k1")
-	c := NewClient(signer)
+	c := NewClient(signer, nil)
 	m := testMessage()
 
 	if err := c.Deliver(context.Background(), m, srv.URL+"/deliver"); err != nil {
@@ -119,7 +119,7 @@ func TestDeliver_SignatureIsValid(t *testing.T) {
 	defer srv.Close()
 
 	signer := fakes.NewSignerFake("k1")
-	c := NewClient(signer)
+	c := NewClient(signer, nil)
 	m := testMessage()
 
 	if err := c.Deliver(context.Background(), m, srv.URL+"/deliver"); err != nil {
@@ -163,7 +163,7 @@ func TestDeliver_SignError(t *testing.T) {
 
 	signer := fakes.NewSignerFake("k1")
 	signer.SetSignError(context.DeadlineExceeded)
-	c := NewClient(signer)
+	c := NewClient(signer, nil)
 
 	if err := c.Deliver(context.Background(), testMessage(), srv.URL+"/deliver"); err == nil {
 		t.Fatal("Deliver: expected error from signer, got nil")
@@ -174,7 +174,7 @@ func TestDeliver_ExpiresAtOmittedWhenNil(t *testing.T) {
 	srv, _, rawBody := captureServer(t, http.StatusOK)
 	defer srv.Close()
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 	m := testMessage()
 	m.ExpiresAt = nil
 
@@ -195,7 +195,7 @@ func TestDeliver_ExpiresAtIncludedWhenSet(t *testing.T) {
 	srv, _, rawBody := captureServer(t, http.StatusOK)
 	defer srv.Close()
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 	m := testMessage() // has a non-nil ExpiresAt
 
 	if err := c.Deliver(context.Background(), m, srv.URL+"/deliver"); err != nil {
@@ -215,7 +215,7 @@ func TestDeliver_NonOKStatus(t *testing.T) {
 	srv, _, _ := captureServer(t, http.StatusBadRequest)
 	defer srv.Close()
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 	if err := c.Deliver(context.Background(), testMessage(), srv.URL+"/deliver"); err == nil {
 		t.Fatal("Deliver: expected error for a 400 response, got nil")
 	}
@@ -226,7 +226,7 @@ func TestDeliver_TransportFailure_ServerClosed(t *testing.T) {
 	inboxURL := srv.URL + "/deliver"
 	srv.Close() // closed before Deliver is ever called
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 	if err := c.Deliver(context.Background(), testMessage(), inboxURL); err == nil {
 		t.Fatal("Deliver: expected a transport error against a closed server, got nil")
 	}
@@ -239,7 +239,7 @@ func TestDeliver_Timeout(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -253,8 +253,45 @@ func TestDeliver_Success_ReturnsNil(t *testing.T) {
 	srv, _, _ := captureServer(t, http.StatusOK)
 	defer srv.Close()
 
-	c := NewClient(fakes.NewSignerFake("k1"))
+	c := NewClient(fakes.NewSignerFake("k1"), nil)
 	if err := c.Deliver(context.Background(), testMessage(), srv.URL+"/deliver"); err != nil {
+		t.Fatalf("Deliver: unexpected error: %v", err)
+	}
+}
+
+// redirectTransport rewrites every outgoing request's scheme/host to target
+// (an httptest.Server's URL) before delegating to the default transport —
+// the same technique internal/adapters/directory/directory_test.go already
+// established for HTTPDirectory, mirrored here to prove NewClient's new
+// httpClient parameter is actually used, not just accepted.
+type redirectTransport struct {
+	target string
+}
+
+func (t redirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	targetURL, err := http.NewRequest(req.Method, t.target+req.URL.Path, req.Body)
+	if err != nil {
+		return nil, err
+	}
+	targetURL = targetURL.WithContext(req.Context())
+	targetURL.Header = req.Header
+	return http.DefaultTransport.RoundTrip(targetURL)
+}
+
+func TestDeliver_UsesInjectedHTTPClient(t *testing.T) {
+	srv, _, _ := captureServer(t, http.StatusOK)
+	defer srv.Close()
+
+	customClient := &http.Client{
+		Transport: redirectTransport{target: srv.URL},
+	}
+	c := NewClient(fakes.NewSignerFake("k1"), customClient)
+
+	// An arbitrary, unroutable-in-reality host/scheme: only reaches srv at
+	// all because customClient's Transport rewrites it there. If Deliver
+	// used a default-constructed *http.Client instead of the injected one,
+	// this request would fail with a DNS/transport error, not land on srv.
+	if err := c.Deliver(context.Background(), testMessage(), "https://fake.invalid/deliver"); err != nil {
 		t.Fatalf("Deliver: unexpected error: %v", err)
 	}
 }

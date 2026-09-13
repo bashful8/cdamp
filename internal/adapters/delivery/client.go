@@ -71,13 +71,19 @@ type Client struct {
 	httpClient *http.Client
 }
 
-// NewClient returns a Client that signs with signer and delivers over a
-// plain stdlib *http.Client (no third-party HTTP dependency), mirroring
-// directory.go's own established pattern for outbound adapters.
-func NewClient(signer domain.Signer) *Client {
+// NewClient returns a Client that signs with signer and delivers over
+// httpClient. If httpClient is nil, a plain stdlib &http.Client{} is used
+// (no third-party HTTP dependency), mirroring directory.go's own
+// NewHTTPDirectory nil-defaults pattern exactly — this lets tests point the
+// client at an httptest.Server via a custom Transport while keeping
+// Deliver's own request construction unchanged.
+func NewClient(signer domain.Signer, httpClient *http.Client) *Client {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
 	return &Client{
 		signer:     signer,
-		httpClient: &http.Client{},
+		httpClient: httpClient,
 	}
 }
 
