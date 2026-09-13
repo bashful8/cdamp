@@ -266,6 +266,161 @@ func TestDashboardThreadUnknownIDReturns404(t *testing.T) {
 	}
 }
 
+func TestDashboardHomeSearchShowsMatchingThreads(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", Subject: "budget report", Body: "the numbers", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m2", AgentID: 1, ThreadID: "t2", Subject: "lunch plans", Body: "pizza", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/?q=budget", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/dashboard/threads/t1"`) || !strings.Contains(body, "budget report") {
+		t.Errorf("body missing matching thread t1:\n%s", body)
+	}
+	if strings.Contains(body, "lunch plans") {
+		t.Errorf("body should not contain non-matching thread's subject:\n%s", body)
+	}
+}
+
+func TestDashboardHomeSearchMergesAcrossAgents(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+	store.AddAgent(&domain.Agent{ID: 2, Name: "bob", TokenHash: "hash-2"})
+
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", Subject: "project apollo kickoff", Body: "let's begin", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m2", AgentID: 2, ThreadID: "t2", Subject: "apollo status update", Body: "on track", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/?q=apollo", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/dashboard/threads/t1"`) {
+		t.Errorf("body missing agent 1's matching thread t1:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/dashboard/threads/t2"`) {
+		t.Errorf("body missing agent 2's matching thread t2:\n%s", body)
+	}
+}
+
+func TestDashboardHomeSearchEmptyResultsNoMatch(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", Subject: "budget report", Body: "the numbers", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/?q=nonexistentquery", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, `href="/dashboard/threads/t1"`) {
+		t.Errorf("body should not contain any thread link:\n%s", body)
+	}
+	if !strings.Contains(body, "Search results for") {
+		t.Errorf("body missing search results heading:\n%s", body)
+	}
+}
+
+func TestDashboardHomeNoQueryShowsAgentsList(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "alice@example.dev") {
+		t.Errorf("body missing alice@example.dev:\n%s", body)
+	}
+	if !strings.Contains(body, `href="/dashboard/agents/1"`) {
+		t.Errorf("body missing link to agent inbox:\n%s", body)
+	}
+	if strings.Contains(body, "Search results for") {
+		t.Errorf("body should not show search results heading:\n%s", body)
+	}
+}
+
+func TestDashboardHomeSearchListAgentsErrorReturns500(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.SetListAgentsErr(errors.New("boom"))
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/?q=budget", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 500 {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestDashboardHomeSearchGetThreadErrorReturns500(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	ctx := context.Background()
+	if err := store.SaveMessage(ctx, &domain.Message{ID: "m1", AgentID: 1, ThreadID: "t1", Subject: "budget report", Body: "the numbers", Read: true}); err != nil {
+		t.Fatalf("SaveMessage: %v", err)
+	}
+	store.SetGetThreadErr(errors.New("boom"))
+
+	cfg := &config.Config{Domain: "example.dev"}
+	handler := NewDashboardHandler(store, cfg)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/dashboard/?q=budget", nil)
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 500 {
+		t.Fatalf("status = %d, want 500 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDashboardThreadGetThreadErrorReturns500(t *testing.T) {
 	store := fakes.NewInboxStoreFake()
 	ctx := context.Background()

@@ -7,6 +7,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
@@ -89,29 +90,107 @@ type messageDetailRow struct {
 	Read     bool
 }
 
+// searchResultRow is the per-thread view-model handleDashboardHome
+// renders when a search query is present — a small, page-specific
+// projection of app.SearchThreadsItem, not that type itself, same
+// rationale messageRow/messageDetailRow's own doc comments give.
+type searchResultRow struct {
+	ThreadID     string
+	Subject      string
+	MessageCount int
+	CreatedAt    time.Time
+}
+
 func handleDashboardHome(store domain.InboxStore, cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		agents, err := store.ListAgents(r.Context())
-		if err != nil {
-			http.Error(w, "failed to list agents", http.StatusInternalServerError)
-			return
-		}
+		q := r.URL.Query().Get("q")
 
-		rows := make([]agentRow, 0, len(agents))
-		for _, a := range agents {
-			unread, err := unreadCount(r.Context(), store, a.ID)
+		data := struct {
+			Query   string
+			Agents  []agentRow
+			Results []searchResultRow
+		}{Query: q}
+
+		if q != "" {
+			results, err := searchAllAgents(r.Context(), store, q)
 			if err != nil {
-				http.Error(w, "failed to count unread messages", http.StatusInternalServerError)
+				http.Error(w, "failed to search threads", http.StatusInternalServerError)
 				return
 			}
-			rows = append(rows, agentRow{ID: a.ID, Address: a.Name + "@" + cfg.Domain, Unread: unread})
+			data.Results = results
+		} else {
+			agents, err := store.ListAgents(r.Context())
+			if err != nil {
+				http.Error(w, "failed to list agents", http.StatusInternalServerError)
+				return
+			}
+			rows := make([]agentRow, 0, len(agents))
+			for _, a := range agents {
+				unread, err := unreadCount(r.Context(), store, a.ID)
+				if err != nil {
+					http.Error(w, "failed to count unread messages", http.StatusInternalServerError)
+					return
+				}
+				rows = append(rows, agentRow{ID: a.ID, Address: a.Name + "@" + cfg.Domain, Unread: unread})
+			}
+			data.Agents = rows
 		}
 
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if err := pages.ExecuteTemplate(w, "agents.html", struct{ Agents []agentRow }{Agents: rows}); err != nil {
+		if err := pages.ExecuteTemplate(w, "agents.html", data); err != nil {
 			http.Error(w, "failed to render", http.StatusInternalServerError)
 		}
 	}
+}
+
+// searchAllAgents runs app.SearchThreads once per local agent and merges
+// the results, since domain.InboxStore.SearchThreads is scoped to one
+// agentID and has no "every agent" mode (see this task's spec "Research"
+// section) — the dashboard's own "sees all agents on the instance"
+// property (02-ARCHITECTURE.md) means a real cross-agent search, not a
+// single scoped call. Deliberately never calls SearchThreads with
+// agentID=0 as an "all agents" sentinel: InboxStoreFake happens to treat
+// 0 as "no filter" (test-fixture convenience only, undocumented on the
+// InboxStore interface), but the real SQLite Store filters
+// unconditionally on m.agent_id = ? and real agent IDs start at 1, so
+// agentID=0 always returns zero rows there — relying on the fake's
+// behavior would pass in tests and silently return nothing in
+// production. Results are deduped by thread ID (a thread can carry
+// messages from more than one local agent) and capped at 50 total with
+// no next_cursor — see "Design decisions" #4 for why that's a documented
+// scope cut, not an oversight.
+func searchAllAgents(ctx context.Context, store domain.InboxStore, q string) ([]searchResultRow, error) {
+	agents, err := store.ListAgents(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[string]bool{}
+	var rows []searchResultRow
+	for _, a := range agents {
+		result, err := app.SearchThreads(ctx, store, a.ID, q, domain.ThreadFilter{Limit: 50})
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range result.Threads {
+			if seen[item.Thread.ID] {
+				continue
+			}
+			seen[item.Thread.ID] = true
+			rows = append(rows, searchResultRow{
+				ThreadID:     item.Thread.ID,
+				Subject:      item.Thread.Subject,
+				MessageCount: item.MessageCount,
+				CreatedAt:    item.Thread.CreatedAt,
+			})
+		}
+	}
+
+	sort.Slice(rows, func(i, j int) bool { return rows[i].CreatedAt.Before(rows[j].CreatedAt) })
+	if len(rows) > 50 {
+		rows = rows[:50]
+	}
+	return rows, nil
 }
 
 // unreadCount returns agentID's unread-message count via the same

@@ -1,13 +1,20 @@
-{{/* agents.html — see layout.html's "layout-head"/"layout-foot" split:
-     each page inlines its own body content between them rather than
-     supplying a shared "body" block, since two files both defining
-     "body" silently collide (STATUS.md, Phase 6 task 6 spec) rather
-     than failing loudly the way the file-name collision task 5 hit
-     did. */}}
 {{define "agents.html"}}{{template "layout-head" .}}
 <h1>Agents</h1>
+<form action="/dashboard/" method="get">
+<input type="text" name="q" value="{{.Query}}" placeholder="search threads">
+<button type="submit">Search</button>
+</form>
+{{if .Query}}
+<h2>Search results for &ldquo;{{.Query}}&rdquo;</h2>
+<table>
+<tr><th>Subject</th><th>Messages</th><th>Created</th></tr>
+{{range .Results}}<tr><td><a href="/dashboard/threads/{{.ThreadID}}">{{.Subject}}</a></td><td>{{.MessageCount}}</td><td>{{.CreatedAt}}</td></tr>{{end}}
+</table>
+<p><a href="/dashboard/">&larr; Clear search</a></p>
+{{else}}
 <table>
 <tr><th>Address</th><th>Unread</th></tr>
 {{range .Agents}}<tr><td><a href="/dashboard/agents/{{.ID}}">{{.Address}}</a></td><td>{{.Unread}}</td></tr>{{end}}
 </table>
+{{end}}
 {{template "layout-foot" .}}{{end}}
