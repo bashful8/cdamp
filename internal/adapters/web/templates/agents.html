@@ -1,0 +1,15 @@
+{{/* agents.html — no leading text outside a {{define}} block here: any
+     text outside a define becomes this file's own implicit "agents.html"-
+     named template, which would then collide with the explicit
+     {{define "agents.html"}} below (html/template: "multiple definition
+     of template \"agents.html\""). Confirmed empirically while building
+     this task; layout.html doesn't have this problem since its internal
+     define is named "layout", not "layout.html". */}}
+{{define "agents.html"}}{{template "layout" .}}{{end}}
+{{define "body"}}
+<h1>Agents</h1>
+<table>
+<tr><th>Address</th><th>Unread</th></tr>
+{{range .Agents}}<tr><td>{{.Address}}</td><td>{{.Unread}}</td></tr>{{end}}
+</table>
+{{end}}

@@ -52,22 +52,33 @@ func adminAuthMiddleware(store domain.AdminStore, next http.Handler) http.Handle
 }
 
 // NewAdminMux returns the HTTP handler for CDAMP's admin API
-// (03-API.md's "Admin API" section): POST/GET /admin/agents and
-// POST/GET /admin/blocklist. Every route requires the admin session
-// cookie (adminAuthMiddleware) and the request body is capped at
+// (03-API.md's "Admin API" section): POST/GET /admin/agents, POST/GET
+// /admin/blocklist, and the human-facing dashboard mounted at
+// "/dashboard/". Every route requires the admin session cookie
+// (adminAuthMiddleware) and the request body is capped at
 // app.MaxBodyBytes, same as every other mux in this package.
+//
+// dashboard is internal/adapters/web.NewDashboardHandler's return value,
+// passed in rather than constructed here: internal/adapters/web must
+// never import this package (02-ARCHITECTURE.md's adapters/*-import-only-
+// domain/app dependency rule), so it cannot reuse adminAuthMiddleware
+// directly. Accepting it as an http.Handler parameter lets this mux
+// mount it behind the same auth/size-limit wrapper as every other admin
+// route without either package importing the other — see STATUS.md's
+// Phase 6 task 5 spec "Design decisions" for the full reasoning.
 //
 // Wiring this into cmd/cdampd/main.go as its own, separately-bound
 // http.Server (not merged into newMux's cfg.ListenAddr mux) is this
 // task's job too — see cmd/cdampd/main.go's "admin http server" wiring
 // for why a second listener, not a second route group on the existing
 // one, is required.
-func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, blocklist domain.BlocklistStore, cfg *config.Config) http.Handler {
+func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, blocklist domain.BlocklistStore, dashboard http.Handler, cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/agents", handleCreateAgentAdmin(inbox, cfg))
 	mux.HandleFunc("GET /admin/agents", handleListAgents(inbox, cfg))
 	mux.HandleFunc("POST /admin/blocklist", handleCreateBlocklistEntry(blocklist))
 	mux.HandleFunc("GET /admin/blocklist", handleListBlocklist(blocklist))
+	mux.Handle("/dashboard/", dashboard)
 
 	return sizeLimitMiddleware(adminAuthMiddleware(admin, mux))
 }

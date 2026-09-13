@@ -321,6 +321,19 @@ func TestInboxStoreFakeListAgents(t *testing.T) {
 	}
 }
 
+func TestInboxStoreFakeListAgentsForcedErr(t *testing.T) {
+	f := NewInboxStoreFake()
+	f.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1"})
+
+	boom := errors.New("boom")
+	f.SetListAgentsErr(boom)
+
+	_, err := f.ListAgents(context.Background())
+	if !errors.Is(err, boom) {
+		t.Fatalf("ListAgents error = %v, want %v", err, boom)
+	}
+}
+
 func TestInboxStoreFakeListAgentsEmpty(t *testing.T) {
 	f := NewInboxStoreFake()
 	got, err := f.ListAgents(context.Background())

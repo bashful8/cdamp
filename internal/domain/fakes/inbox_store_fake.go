@@ -36,6 +36,14 @@ type InboxStoreFake struct {
 	// nextAgentID is the next id CreateAgent will assign, mirroring the
 	// sqlite adapter's auto-incrementing INTEGER PRIMARY KEY.
 	nextAgentID int64
+	// listAgentsErr, when set via SetListAgentsErr, makes ListAgents
+	// return this error instead of its normal result — mirrors
+	// AdminStoreFake's SetGetErr/getErr forced-error injection shape
+	// exactly, added per STATUS.md's Phase 6 task 5 testing-checklist
+	// correction: nothing else on InboxStoreFake lets a test make
+	// ListAgents fail, and internal/adapters/web's
+	// TestDashboardHomeStoreErrorReturns500 needs to.
+	listAgentsErr error
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
@@ -294,14 +302,29 @@ func (f *InboxStoreFake) FindAgentByName(ctx context.Context, name string) (*dom
 	return a, nil
 }
 
+// SetListAgentsErr makes every subsequent ListAgents call return err
+// instead of its normal result — mirrors AdminStoreFake.SetGetErr exactly,
+// used to test callers' handling of a real ListAgents failure (e.g.
+// internal/adapters/web's dashboard handler mapping it to a 500).
+func (f *InboxStoreFake) SetListAgentsErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listAgentsErr = err
+}
+
 // ListAgents returns every seeded/created agent, ordered by ID ascending
 // (mirrors ListMessages'/SearchThreads' sort-for-determinism pattern in
 // this same file) — nil for an empty map, matching the SQLite adapter's
 // own empty-result shape. Added additively for GET /admin/agents (Phase
-// 6 task 3).
+// 6 task 3). Returns the forced error from SetListAgentsErr, if set,
+// before doing anything else — mirrors
+// AdminStoreFake.GetAdminCredential's own getErr check exactly.
 func (f *InboxStoreFake) ListAgents(ctx context.Context) ([]*domain.Agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listAgentsErr != nil {
+		return nil, f.listAgentsErr
+	}
 	if len(f.agents) == 0 {
 		return nil, nil
 	}

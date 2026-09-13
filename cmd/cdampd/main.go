@@ -16,6 +16,7 @@ import (
 	"cdamp/internal/adapters/directory"
 	"cdamp/internal/adapters/signing"
 	"cdamp/internal/adapters/storage/sqlite"
+	"cdamp/internal/adapters/web"
 	"cdamp/internal/app"
 	"cdamp/internal/config"
 	"cdamp/internal/domain"
@@ -95,17 +96,23 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	server := newServer(mux, cfg, logger)
 
 	// The admin surface (POST/GET /admin/agents, POST/GET
-	// /admin/blocklist) is served on its own, independently-bound
-	// http.Server — not a route group on the mux above — since
-	// 02-ARCHITECTURE.md's Auth table says it's "bound to localhost by
-	// default", only meaningful if it's reachable at a genuinely
-	// different address than cfg.ListenAddr (which may be 0.0.0.0-bound
-	// in production for federation traffic). store satisfies
-	// domain.InboxStore, domain.AdminStore, and domain.BlocklistStore
-	// simultaneously - the same *sqlite.Store value passed three times
-	// below, same "one concrete store, many narrow ports" pattern as
-	// above.
-	adminMux := httpadapter.NewAdminMux(store, store, store, cfg)
+	// /admin/blocklist, /dashboard/) is served on its own,
+	// independently-bound http.Server — not a route group on the mux
+	// above — since 02-ARCHITECTURE.md's Auth table says it's "bound to
+	// localhost by default", only meaningful if it's reachable at a
+	// genuinely different address than cfg.ListenAddr (which may be
+	// 0.0.0.0-bound in production for federation traffic). store
+	// satisfies domain.InboxStore, domain.AdminStore, and
+	// domain.BlocklistStore simultaneously - the same *sqlite.Store
+	// value passed three times below, same "one concrete store, many
+	// narrow ports" pattern as above. dashboard is constructed
+	// separately (internal/adapters/web.NewDashboardHandler) and passed
+	// in as NewAdminMux's fourth argument so it can be mounted behind
+	// the same admin-session auth without internal/adapters/web
+	// importing internal/adapters/http (see STATUS.md's Phase 6 task 5
+	// spec "Design decisions").
+	dashboard := web.NewDashboardHandler(store, cfg)
+	adminMux := httpadapter.NewAdminMux(store, store, store, dashboard, cfg)
 	adminServer := &http.Server{
 		Addr:    cfg.AdminBindAddr,
 		Handler: loggingMiddleware(logger, adminMux),

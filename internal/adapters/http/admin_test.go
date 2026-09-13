@@ -35,7 +35,11 @@ func newTestAdminMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.
 		t.Fatalf("seeding admin credential: %v", err)
 	}
 	cfg := &config.Config{Domain: "example.dev"}
-	return NewAdminMux(inbox, admin, blocklist, cfg), inbox, admin, blocklist, cfg
+	// A plain http.NewServeMux() stub is enough for the dashboard
+	// parameter here: none of this file's tests exercise /dashboard/*,
+	// which is covered by internal/adapters/web's own tests instead
+	// (see STATUS.md's Phase 6 task 5 spec).
+	return NewAdminMux(inbox, admin, blocklist, http.NewServeMux(), cfg), inbox, admin, blocklist, cfg
 }
 
 // doAdminRequest issues a request against mux, attaching the admin cookie
@@ -185,7 +189,7 @@ func TestAdminMuxNoCredentialBootstrappedRejected(t *testing.T) {
 	admin := fakes.NewAdminStoreFake() // no SaveAdminCredential call: GetAdminCredential returns ErrNotFound
 	blocklist := fakes.NewBlocklistStoreFake()
 	cfg := &config.Config{Domain: "example.dev"}
-	mux := NewAdminMux(inbox, admin, blocklist, cfg)
+	mux := NewAdminMux(inbox, admin, blocklist, http.NewServeMux(), cfg)
 
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/agents", "anything", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
