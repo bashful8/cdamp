@@ -143,3 +143,107 @@ func TestSendMailTool_RESTErrorBecomesToolError(t *testing.T) {
 		t.Fatalf("res.IsError = false, want true (content: %+v)", res.Content)
 	}
 }
+
+func TestReadMessageTool_CallsCorrectEndpoint(t *testing.T) {
+	const token = "test-bearer-token"
+
+	var (
+		gotMethod string
+		gotPath   string
+		gotAuth   string
+	)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(readMessageOut{
+			ID:        "msg-123",
+			ThreadID:  "thread-1",
+			Direction: "inbound",
+			From:      "alice@example.com",
+			To:        "bob@example.com",
+			Subject:   "hello",
+			Body:      "hi there",
+			Priority:  "normal",
+			SentAt:    "2026-09-13T00:00:00Z",
+			Trust:     "verified",
+			Status:    "delivered",
+		})
+	})
+
+	session := newTestSession(t, handler, token)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "read_message",
+		Arguments: map[string]any{
+			"id": "msg-123",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if gotPath != "/messages/msg-123" {
+		t.Errorf("path = %q, want /messages/msg-123", gotPath)
+	}
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+	if structured["id"] != "msg-123" {
+		t.Errorf("StructuredContent[id] = %v, want msg-123", structured["id"])
+	}
+	if structured["subject"] != "hello" {
+		t.Errorf("StructuredContent[subject] = %v, want hello", structured["subject"])
+	}
+	if structured["body"] != "hi there" {
+		t.Errorf("StructuredContent[body] = %v, want %q", structured["body"], "hi there")
+	}
+	if structured["status"] != "delivered" {
+		t.Errorf("StructuredContent[status] = %v, want delivered", structured["status"])
+	}
+}
+
+func TestReadMessageTool_NotFoundBecomesToolError(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]string{
+				"code":    "not_found",
+				"message": "message not found",
+			},
+		})
+	})
+
+	session := newTestSession(t, handler, "test-bearer-token")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "read_message",
+		Arguments: map[string]any{
+			"id": "does-not-exist",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned a protocol-level error, want err == nil with res.IsError instead: %v", err)
+	}
+
+	if !res.IsError {
+		t.Fatalf("res.IsError = false, want true (content: %+v)", res.Content)
+	}
+}
