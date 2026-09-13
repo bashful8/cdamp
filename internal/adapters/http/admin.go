@@ -52,10 +52,9 @@ func adminAuthMiddleware(store domain.AdminStore, next http.Handler) http.Handle
 }
 
 // NewAdminMux returns the HTTP handler for CDAMP's admin API
-// (03-API.md's "Admin API" section): POST/GET /admin/agents only — the
-// blocklist routes are a separate, still-blocked task (Phase 6 task 4,
-// see STATUS.md). Every route requires the admin session cookie
-// (adminAuthMiddleware) and the request body is capped at
+// (03-API.md's "Admin API" section): POST/GET /admin/agents and
+// POST/GET /admin/blocklist. Every route requires the admin session
+// cookie (adminAuthMiddleware) and the request body is capped at
 // app.MaxBodyBytes, same as every other mux in this package.
 //
 // Wiring this into cmd/cdampd/main.go as its own, separately-bound
@@ -63,10 +62,12 @@ func adminAuthMiddleware(store domain.AdminStore, next http.Handler) http.Handle
 // task's job too — see cmd/cdampd/main.go's "admin http server" wiring
 // for why a second listener, not a second route group on the existing
 // one, is required.
-func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, cfg *config.Config) http.Handler {
+func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, blocklist domain.BlocklistStore, cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/agents", handleCreateAgentAdmin(inbox, cfg))
 	mux.HandleFunc("GET /admin/agents", handleListAgents(inbox, cfg))
+	mux.HandleFunc("POST /admin/blocklist", handleCreateBlocklistEntry(blocklist))
+	mux.HandleFunc("GET /admin/blocklist", handleListBlocklist(blocklist))
 
 	return sizeLimitMiddleware(adminAuthMiddleware(admin, mux))
 }
@@ -133,6 +134,89 @@ func handleListAgents(inbox domain.InboxStore, cfg *config.Config) http.HandlerF
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"agents": items,
+		})
+	}
+}
+
+// createBlocklistEntryRequest is the JSON body shape for POST
+// /admin/blocklist, per 03-API.md: {domain, reason}.
+type createBlocklistEntryRequest struct {
+	Domain string `json:"domain"`
+	Reason string `json:"reason"`
+}
+
+// blocklistEntryResponse is the JSON shape of one domain_blocklist
+// entry: 03-API.md pins POST /admin/blocklist's 201 response to exactly
+// {domain, reason, added_at}; GET /admin/blocklist's line only gives an
+// elliptical {domains: [...]}, so this handler reuses the POST
+// response's own shape for each list entry too (see this task's
+// "Design decisions" section — the same "list mirrors create" pattern
+// GET /admin/agents already established).
+type blocklistEntryResponse struct {
+	Domain  string    `json:"domain"`
+	Reason  string    `json:"reason"`
+	AddedAt time.Time `json:"added_at"`
+}
+
+// handleCreateBlocklistEntry implements POST /admin/blocklist: body
+// {domain, reason} -> 201 {domain, reason, added_at}, per 03-API.md. A
+// duplicate domain maps to domain.ErrConflict -> 409 conflict via
+// mapDomainError's existing branch (Phase 6 task 3), per the
+// human-resolved Blocklist port decision (STATUS.md, 2026-09-13) — no
+// idempotent-200 special case. No validation beyond the store's own
+// PRIMARY KEY constraint is invented here, matching
+// handleCreateAgentAdmin's own "03-API.md documents no validation error
+// shape for this endpoint" precedent.
+func handleCreateBlocklistEntry(bl domain.BlocklistStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req createBlocklistEntryRequest
+		if err := decodeJSONBody(w, r, &req); err != nil {
+			return // decodeJSONBody already wrote the error response
+		}
+
+		entry := &domain.BlocklistEntry{
+			Domain:  req.Domain,
+			Reason:  req.Reason,
+			AddedAt: time.Now().UTC(),
+		}
+		if err := bl.SaveBlocklistEntry(r.Context(), entry); err != nil {
+			status, code := mapDomainError(err)
+			writeError(w, status, code, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, blocklistEntryResponse{
+			Domain:  entry.Domain,
+			Reason:  entry.Reason,
+			AddedAt: entry.AddedAt,
+		})
+	}
+}
+
+// handleListBlocklist implements GET /admin/blocklist: -> 200
+// {domains: [{domain, reason, added_at}]}, per 03-API.md (see
+// blocklistEntryResponse's doc comment for the per-entry shape's own
+// judgment call). Empty -> {"domains": []}, not {"domains": null}, same
+// make([]T, 0, ...) discipline as handleListAgents.
+func handleListBlocklist(bl domain.BlocklistStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		entries, err := bl.ListBlocklist(r.Context())
+		if err != nil {
+			status, code := mapDomainError(err)
+			writeError(w, status, code, err.Error())
+			return
+		}
+
+		items := make([]blocklistEntryResponse, 0, len(entries))
+		for _, e := range entries {
+			items = append(items, blocklistEntryResponse{
+				Domain:  e.Domain,
+				Reason:  e.Reason,
+				AddedAt: e.AddedAt,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"domains": items,
 		})
 	}
 }

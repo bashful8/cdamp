@@ -141,3 +141,34 @@ type AdminStore interface {
 	// via any in-application check here).
 	SaveAdminCredential(ctx context.Context, c *AdminCredential) error
 }
+
+// BlocklistStore persists and lists federation-wide blocked sender
+// domains (domain_blocklist). Added additively per STATUS.md's
+// "Blocklist port decision (human-resolved, 2026-09-13)": kept as its
+// own dedicated port rather than folded onto InboxStore or AdminStore
+// — domain_blocklist is federation-wide policy, a third category
+// distinct from both "one agent's inbox" (InboxStore's own stated
+// scope) and "a human's dashboard session" (AdminStore's own stated
+// scope). Actual enforcement of the blocklist on POST /deliver
+// (03-API.md: -> 403 blocklisted) is Phase 8 (Hardening) per
+// 04-BUILD-PLAN.md — this port only backs the admin read/write API
+// (03-API.md's Admin API section); nothing calls it from the
+// federation-delivery path yet.
+type BlocklistStore interface {
+	// SaveBlocklistEntry persists e as a new domain_blocklist row.
+	// Returns a wrapped ErrConflict if e.Domain is already blocklisted
+	// (domain_blocklist.domain is PRIMARY KEY) — mirrors CreateAgent's
+	// own UNIQUE-constraint-to-ErrConflict translation, per the
+	// Blocklist port decision's resolved conflict-handling
+	// sub-question (409, no idempotent-200 special case).
+	SaveBlocklistEntry(ctx context.Context, e *BlocklistEntry) error
+
+	// ListBlocklist returns every blocklisted domain, ordered by
+	// Domain ascending (the table's own primary key) for deterministic
+	// listing — mirrors ListAgents' own "no filter/paging params
+	// documented" reasoning; 03-API.md's GET /admin/blocklist returns
+	// the full set with no filter/paging shape documented either.
+	// Returns nil (not an error) for zero rows, same "empty is a valid
+	// non-error state" contract ListAgents already established.
+	ListBlocklist(ctx context.Context) ([]*BlocklistEntry, error)
+}
