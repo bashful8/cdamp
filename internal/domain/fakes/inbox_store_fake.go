@@ -33,6 +33,9 @@ type InboxStoreFake struct {
 	// decision (human-resolved, 2026-09-12)". Kept in sync with agents by
 	// AddAgent.
 	agentsByName map[string]*domain.Agent
+	// nextAgentID is the next id CreateAgent will assign, mirroring the
+	// sqlite adapter's auto-incrementing INTEGER PRIMARY KEY.
+	nextAgentID int64
 }
 
 // NewInboxStoreFake returns an empty InboxStoreFake ready to use.
@@ -289,4 +292,23 @@ func (f *InboxStoreFake) FindAgentByName(ctx context.Context, name string) (*dom
 		return nil, domain.ErrNotFound
 	}
 	return a, nil
+}
+
+// CreateAgent persists a newly created local Agent: rejects a duplicate
+// a.Name with domain.ErrConflict (mirroring the sqlite adapter's
+// agents.name UNIQUE constraint), otherwise assigns a.ID (a sequential
+// counter, starting at 1) and a.CreatedAt (time.Now()), writes both back
+// onto a, and indexes it the same way AddAgent does.
+func (f *InboxStoreFake) CreateAgent(ctx context.Context, a *domain.Agent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, exists := f.agentsByName[a.Name]; exists {
+		return domain.ErrConflict
+	}
+	f.nextAgentID++
+	a.ID = f.nextAgentID
+	a.CreatedAt = time.Now()
+	f.agents[a.ID] = a
+	f.agentsByName[a.Name] = a
+	return nil
 }

@@ -683,6 +683,36 @@ func (s *Store) FindAgentByName(ctx context.Context, name string) (*domain.Agent
 	return a, nil
 }
 
+// CreateAgent persists a newly created local Agent: a.Name and
+// a.TokenHash must already be set by the caller, and this call assigns
+// a.ID (via sql.Result.LastInsertId) and a.CreatedAt (set here, to the
+// current time), writing both back onto a on success. Mirrors
+// SaveMessage's own idx_messages_idem unique-constraint-violation
+// detection technique (*msqlite.Error / sqliteConstraintUniqueCode) to
+// map a duplicate agents.name (UNIQUE per migrations/0001_init.up.sql)
+// to a wrapped domain.ErrConflict.
+func (s *Store) CreateAgent(ctx context.Context, a *domain.Agent) error {
+	createdAt := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		"INSERT INTO agents (name, token_hash, created_at) VALUES (?, ?, ?)",
+		a.Name, a.TokenHash, createdAt.Unix(),
+	)
+	if err != nil {
+		var sqliteErr *msqlite.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqliteConstraintUniqueCode {
+			return fmt.Errorf("creating agent %q: %w", a.Name, domain.ErrConflict)
+		}
+		return fmt.Errorf("creating agent %q: %w", a.Name, err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return fmt.Errorf("creating agent %q: getting last insert id: %w", a.Name, err)
+	}
+	a.ID = id
+	a.CreatedAt = createdAt
+	return nil
+}
+
 // scanAgent scans one agents row (id, name, token_hash, created_at, in that
 // order) into a domain.Agent.
 func scanAgent(row scanner) (*domain.Agent, error) {

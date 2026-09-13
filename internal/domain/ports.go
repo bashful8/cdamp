@@ -47,6 +47,16 @@ type InboxStore interface {
 	// can do that lookup. Returns ErrNotFound on a miss, consistent with
 	// every other InboxStore lookup method.
 	FindAgentByName(ctx context.Context, name string) (*Agent, error)
+
+	// CreateAgent persists a newly created local Agent. a.Name and
+	// a.TokenHash must already be set by the caller (internal/app's
+	// CreateAgent use case generates the plaintext token and hashes it —
+	// crypto/sha256, hex, the same scheme
+	// internal/adapters/http/middleware.go's hashBearerToken uses —
+	// before calling this; InboxStore never sees a raw secret). a.ID and
+	// a.CreatedAt are assigned by this call and written back onto a.
+	// Returns a wrapped ErrConflict if a.Name already exists.
+	CreateAgent(ctx context.Context, a *Agent) error
 }
 
 // Directory resolves an address to the data needed to deliver to it,

@@ -24,3 +24,9 @@ var ErrDuplicateIdempotencyKey = errors.New("duplicate idempotency key")
 // adapter (Phase 3 task 2) maps it to the documented
 // `400 {"error":{"code":"bad_request",...}}` shape.
 var ErrValidation = errors.New("validation failed")
+
+// ErrConflict is returned by InboxStore.CreateAgent when a.Name already
+// exists (agents.name is UNIQUE). Distinguish it with errors.Is, same
+// convention as ErrNotFound/ErrValidation; the HTTP adapter (a later
+// task) maps it to 409 conflict.
+var ErrConflict = errors.New("conflict")
