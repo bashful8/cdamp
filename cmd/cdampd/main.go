@@ -98,12 +98,14 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	worker := delivery.NewWorker(store, dir, deliveryClient, cfg.RetrySchedule)
 
+	limiters := httpadapter.NewDomainLimiters(float64(cfg.RateLimit.PerDomainRPS), cfg.RateLimit.Burst)
+
 	// store satisfies domain.InboxStore, domain.SigningKeyStore, and
 	// domain.BlocklistStore simultaneously - the same *sqlite.Store value
 	// is passed three times below, no second store instance (same "one
 	// concrete store, many narrow ports" pattern as the admin mux wiring
 	// below).
-	mux := newMux(store, store, dir, verifier, store, cfg)
+	mux := newMux(store, store, dir, verifier, store, limiters, cfg)
 	server := newServer(mux, cfg, logger)
 
 	// The admin surface (POST/GET /admin/agents, POST/GET
@@ -132,7 +134,8 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go worker.Run(ctx) // stops when ctx is canceled by the same shutdown signal
+	go worker.Run(ctx)   // stops when ctx is canceled by the same shutdown signal
+	go limiters.Run(ctx) // same shutdown-signal-driven lifecycle as the worker
 
 	go func() {
 		logger.Info("http server listening", "addr", cfg.ListenAddr)
@@ -236,9 +239,9 @@ func newServer(mux *http.ServeMux, cfg *config.Config, logger *slog.Logger) *htt
 // return fully self-contained, middleware-wrapped http.Handlers that
 // re-match the full request path internally, so no http.StripPrefix is
 // needed here.
-func newMux(store domain.InboxStore, keys domain.SigningKeyStore, dir domain.Directory, verifier domain.Verifier, blocklist domain.BlocklistStore, cfg *config.Config) *http.ServeMux {
+func newMux(store domain.InboxStore, keys domain.SigningKeyStore, dir domain.Directory, verifier domain.Verifier, blocklist domain.BlocklistStore, limiters *httpadapter.DomainLimiters, cfg *config.Config) *http.ServeMux {
 	localHandler := httpadapter.NewLocalMux(store, cfg)
-	federationHandler := httpadapter.NewFederationMux(store, keys, dir, verifier, blocklist, cfg)
+	federationHandler := httpadapter.NewFederationMux(store, keys, dir, verifier, blocklist, limiters, cfg)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler)

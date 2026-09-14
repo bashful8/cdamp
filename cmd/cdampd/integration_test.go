@@ -45,6 +45,8 @@ import (
 	"cdamp/internal/adapters/storage/sqlite"
 	"cdamp/internal/config"
 	"cdamp/internal/domain"
+
+	httpadapter "cdamp/internal/adapters/http"
 )
 
 // shortTestRetrySchedule is the short, test-only retry schedule required
@@ -236,7 +238,11 @@ func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTP
 	deliveryClient := delivery.NewClient(signer, deliveryHTTPClient)
 	worker := delivery.NewWorker(store, dir, deliveryClient, cfg.RetrySchedule)
 
-	mux := newMux(store, store, dir, verifier, store, cfg)
+	// Generous rate/burst: this test's real end-to-end federation traffic
+	// must never be rejected by rate limiting, which is unrelated to what
+	// this file tests.
+	limiters := httpadapter.NewDomainLimiters(1000, 1000)
+	mux := newMux(store, store, dir, verifier, store, limiters, cfg)
 
 	// io.Discard: this test asserts on message/store state, not log
 	// output, and letting every instance log to the test's real stdout

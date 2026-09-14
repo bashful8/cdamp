@@ -30,12 +30,13 @@ func NewFederationMux(
 	directory domain.Directory,
 	verifier domain.Verifier,
 	blocklist domain.BlocklistStore,
+	limiters *DomainLimiters,
 	cfg *config.Config,
 ) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/cdamp/{agent}", handleWellKnownAgent(store, keys, cfg))
 	mux.HandleFunc("GET /.well-known/cdamp/keys", handleWellKnownKeys(keys, cfg))
-	mux.HandleFunc("POST /deliver", handleDeliver(store, directory, verifier, blocklist))
+	mux.HandleFunc("POST /deliver", handleDeliver(store, directory, verifier, blocklist, limiters))
 
 	return sizeLimitMiddleware(mux)
 }
@@ -204,13 +205,14 @@ type deliverEnvelope struct {
 	Payload        deliverPayload `json:"payload"`
 }
 
-// handleDeliver implements POST /deliver. Blocklist enforcement
-// (01-PROTOCOL.md's /deliver response code 403 blocklisted) runs right
-// after the envelope is decoded and before app.ReceiveMessage is ever
-// called (Phase 8 task 1, STATUS.md). Rate limiting (429) is a separate,
-// not-yet-built Phase 8 task, so this handler still maps
-// app.ReceiveMessage's own result/errors to bad_request/internal_error/200.
-func handleDeliver(store domain.InboxStore, directory domain.Directory, verifier domain.Verifier, blocklist domain.BlocklistStore) http.HandlerFunc {
+// handleDeliver implements POST /deliver. Rate limiting (429
+// rate_limited, Phase 8 task 2) and blocklist enforcement (403
+// blocklisted, Phase 8 task 1) both run right after the envelope is
+// decoded and before app.ReceiveMessage is ever called, rate limit
+// first per 02-ARCHITECTURE.md line 160's literal ordering ("size
+// limit, rate limit, blocklist check") -- see STATUS.md's Phase 8 task
+// 2 spec, design decision 4.
+func handleDeliver(store domain.InboxStore, directory domain.Directory, verifier domain.Verifier, blocklist domain.BlocklistStore, limiters *DomainLimiters) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var env deliverEnvelope
 		if err := decodeJSONBody(w, r, &env); err != nil {
@@ -218,6 +220,12 @@ func handleDeliver(store domain.InboxStore, directory domain.Directory, verifier
 		}
 
 		domainName := senderDomain(env.From)
+
+		if !limiters.Allow(domainName) {
+			writeError(w, http.StatusTooManyRequests, "rate_limited", fmt.Sprintf("rate limit exceeded for sender domain %q", domainName))
+			return
+		}
+
 		blocked, err := isDomainBlocklisted(r.Context(), blocklist, domainName)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())

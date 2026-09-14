@@ -17,6 +17,14 @@ import (
 	"cdamp/internal/domain/fakes"
 )
 
+// newFederationTestMux builds a NewFederationMux with fresh fakes for
+// every port, plus a generously-configured *DomainLimiters (rps/burst
+// far above anything these tests could trigger) so rate limiting never
+// interferes with the pre-existing TestDeliver*/TestWellKnown* suite or
+// task 1's blocklist tests -- every one of those issues at least one
+// POST /deliver. Tests specifically about rate limiting build their own
+// NewFederationMux call with a tiny-burst *DomainLimiters instead of
+// using this helper.
 func newFederationTestMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.SigningKeyStoreFake, *fakes.DirectoryFake, *fakes.BlocklistStoreFake, *config.Config) {
 	t.Helper()
 	store := fakes.NewInboxStoreFake()
@@ -24,8 +32,9 @@ func newFederationTestMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *f
 	directory := fakes.NewDirectoryFake()
 	verifier := fakes.NewVerifierFake()
 	blocklist := fakes.NewBlocklistStoreFake()
+	limiters := NewDomainLimiters(1000, 1000)
 	cfg := &config.Config{Domain: "example.dev"}
-	mux := NewFederationMux(store, keys, directory, verifier, blocklist, cfg)
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, limiters, cfg)
 	return mux, store, keys, directory, blocklist, cfg
 }
 
@@ -326,8 +335,9 @@ func TestHandleDeliver_BlocklistedSenderDomainReturns403(t *testing.T) {
 	if err := blocklist.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{Domain: "other.dev", Reason: "spam"}); err != nil {
 		t.Fatalf("SaveBlocklistEntry: %v", err)
 	}
+	limiters := NewDomainLimiters(1000, 1000)
 	cfg := &config.Config{Domain: "example.dev"}
-	mux := NewFederationMux(store, keys, directory, verifier, blocklist, cfg)
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, limiters, cfg)
 
 	// validEnvelope's default "from" is "researcher@other.dev" — the
 	// blocklisted domain seeded above.
@@ -407,6 +417,64 @@ func TestIsDomainBlocklisted(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHandleDeliver_RateLimitExceededReturns429 implements STATUS.md's
+// Phase 8 task 2 testing checklist: a *DomainLimiters built at rps=0,
+// burst=1 allows exactly one POST /deliver from a given sender domain
+// before rejecting the next with 429 rate_limited, and the rejected
+// request never reaches persistence (countingStore, same pattern as
+// task 1's blocklist test).
+func TestHandleDeliver_RateLimitExceededReturns429(t *testing.T) {
+	inner := fakes.NewInboxStoreFake()
+	inner.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
+	store := &countingStore{InboxStoreFake: inner}
+	keys := fakes.NewSigningKeyStoreFake()
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+	blocklist := fakes.NewBlocklistStoreFake()
+	limiters := NewDomainLimiters(0, 1)
+	cfg := &config.Config{Domain: "example.dev"}
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, limiters, cfg)
+
+	rec1 := doFederationPost(mux, "/deliver", validEnvelope(map[string]any{"idempotency_key": "idk_rl_1"}))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first delivery status = %d, want 200 (body: %s)", rec1.Code, rec1.Body.String())
+	}
+
+	rec2 := doFederationPost(mux, "/deliver", validEnvelope(map[string]any{"idempotency_key": "idk_rl_2", "id": "msg_1757683200_rl2"}))
+	assertErrorResponse(t, rec2, http.StatusTooManyRequests, "rate_limited")
+
+	if store.saveMessageCalls != 1 {
+		t.Fatalf("SaveMessage calls = %d, want 1 (only the first, allowed request should ever reach persistence)", store.saveMessageCalls)
+	}
+}
+
+// TestHandleDeliver_RateLimitCheckRunsBeforeBlocklistCheck proves design
+// decision 4's ordering: a request whose sender domain is simultaneously
+// rate-limit-exhausted and blocklisted gets 429 rate_limited, not 403
+// blocklisted.
+func TestHandleDeliver_RateLimitCheckRunsBeforeBlocklistCheck(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
+	keys := fakes.NewSigningKeyStoreFake()
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+	blocklist := fakes.NewBlocklistStoreFake()
+	if err := blocklist.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{Domain: "other.dev", Reason: "spam"}); err != nil {
+		t.Fatalf("SaveBlocklistEntry: %v", err)
+	}
+	limiters := NewDomainLimiters(0, 1)
+	// validEnvelope's default "from" domain is "other.dev" -- exhaust its
+	// one-token bucket before the test's real request, so the very first
+	// POST /deliver below already finds the bucket empty.
+	limiters.Allow("other.dev")
+	cfg := &config.Config{Domain: "example.dev"}
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, limiters, cfg)
+
+	body := validEnvelope(nil)
+	rec := doFederationPost(mux, "/deliver", body)
+	assertErrorResponse(t, rec, http.StatusTooManyRequests, "rate_limited")
 }
 
 func TestSenderDomain(t *testing.T) {

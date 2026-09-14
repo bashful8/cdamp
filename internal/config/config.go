@@ -151,6 +151,17 @@ func parseDurations(field string, ss []string) ([]time.Duration, error) {
 // category as tokenBytes/shutdownTimeout/adminCookieName.
 const defaultAdminBindAddr = "127.0.0.1:8444"
 
+// defaultPerDomainRPS and defaultBurst are applied by Load when an
+// operator's config file omits the rate_limit: block entirely (both
+// fields zero-valued) -- see STATUS.md's Phase 8 task 2 spec, design
+// decision 8. Values match 02-ARCHITECTURE.md's own example config
+// (rate_limit: { per_domain_rps: 5, burst: 20 }), the closest thing to
+// a pinned default this project has.
+const (
+	defaultPerDomainRPS = 5
+	defaultBurst        = 20
+)
+
 // Load reads the YAML config file at path, applies CDAMPD_*-style
 // environment variable overrides on top of it, then resolves the
 // signing-key passphrase from the environment variable named by
@@ -173,6 +184,14 @@ func Load(path string) (*Config, error) {
 
 	if cfg.AdminBindAddr == "" {
 		cfg.AdminBindAddr = defaultAdminBindAddr
+	}
+
+	// Both fields zero-valued means the whole rate_limit: block was
+	// omitted from the YAML file -- an operator who deliberately sets
+	// only one of the two fields is not second-guessed (decision 8).
+	if cfg.RateLimit.PerDomainRPS == 0 && cfg.RateLimit.Burst == 0 {
+		cfg.RateLimit.PerDomainRPS = defaultPerDomainRPS
+		cfg.RateLimit.Burst = defaultBurst
 	}
 
 	// Never stored in the YAML file itself: resolved from whichever env

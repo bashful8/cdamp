@@ -102,6 +102,80 @@ func TestLoad_AdminBindAddrDefaultsWhenUnset(t *testing.T) {
 	}
 }
 
+// noRateLimitYAML omits the rate_limit: block entirely, to exercise
+// Load's fallback-to-default-rate-limit path (both fields zero-valued).
+const noRateLimitYAML = `
+domain: agents.example.dev
+listen_addr: ":8443"
+sqlite_path: "./cdampd.db"
+signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
+`
+
+// explicitRateLimitYAML sets both rate_limit fields explicitly; Load
+// must pass them through unchanged, never applying the default.
+const explicitRateLimitYAML = `
+domain: agents.example.dev
+listen_addr: ":8443"
+sqlite_path: "./cdampd.db"
+signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
+rate_limit: { per_domain_rps: 1, burst: 1 }
+`
+
+// partialRateLimitYAML sets only one of the two rate_limit fields to a
+// nonzero value; per decision 8, the "both zero" precondition means the
+// default must NOT be applied to either field in this case (burst stays
+// its YAML-omitted zero value, not defaultBurst).
+const partialRateLimitYAML = `
+domain: agents.example.dev
+listen_addr: ":8443"
+sqlite_path: "./cdampd.db"
+signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
+rate_limit: { per_domain_rps: 7 }
+`
+
+func TestLoad_RateLimitDefaultsWhenOmitted(t *testing.T) {
+	t.Setenv("CDAMPD_KEY_PASSPHRASE", "hunter2")
+
+	t.Run("rate_limit block omitted entirely", func(t *testing.T) {
+		cfg, err := Load(writeTempConfig(t, noRateLimitYAML))
+		if err != nil {
+			t.Fatalf("Load returned unexpected error: %v", err)
+		}
+		if cfg.RateLimit.PerDomainRPS != defaultPerDomainRPS {
+			t.Errorf("RateLimit.PerDomainRPS = %d, want default %d", cfg.RateLimit.PerDomainRPS, defaultPerDomainRPS)
+		}
+		if cfg.RateLimit.Burst != defaultBurst {
+			t.Errorf("RateLimit.Burst = %d, want default %d", cfg.RateLimit.Burst, defaultBurst)
+		}
+	})
+
+	t.Run("rate_limit block set explicitly passes through unchanged", func(t *testing.T) {
+		cfg, err := Load(writeTempConfig(t, explicitRateLimitYAML))
+		if err != nil {
+			t.Fatalf("Load returned unexpected error: %v", err)
+		}
+		if cfg.RateLimit.PerDomainRPS != 1 {
+			t.Errorf("RateLimit.PerDomainRPS = %d, want 1 (explicit value, no default override)", cfg.RateLimit.PerDomainRPS)
+		}
+		if cfg.RateLimit.Burst != 1 {
+			t.Errorf("RateLimit.Burst = %d, want 1 (explicit value, no default override)", cfg.RateLimit.Burst)
+		}
+	})
+
+	t.Run("only one field nonzero applies no default to either", func(t *testing.T) {
+		cfg, err := Load(writeTempConfig(t, partialRateLimitYAML))
+		if err != nil {
+			t.Fatalf("Load returned unexpected error: %v", err)
+		}
+		if cfg.RateLimit.PerDomainRPS != 7 {
+			t.Errorf("RateLimit.PerDomainRPS = %d, want 7 (explicit value)", cfg.RateLimit.PerDomainRPS)
+		}
+		if cfg.RateLimit.Burst != 0 {
+			t.Errorf("RateLimit.Burst = %d, want 0 (default must not apply when only one field is nonzero)", cfg.RateLimit.Burst)
+		}
+	})
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {

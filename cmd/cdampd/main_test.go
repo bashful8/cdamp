@@ -10,11 +10,15 @@ import (
 
 	"cdamp/internal/config"
 	"cdamp/internal/domain/fakes"
+
+	httpadapter "cdamp/internal/adapters/http"
 )
 
 // newTestMux builds a newMux with fresh fakes for every port, for tests
 // that only care about the combined-mux routing behavior, not any
-// particular adapter's real logic.
+// particular adapter's real logic. The DomainLimiters is constructed
+// generously (rps/burst far above anything these tests could trigger)
+// so rate limiting never interferes with unrelated assertions here.
 func newTestMux(cfg *config.Config) *http.ServeMux {
 	return newMux(
 		fakes.NewInboxStoreFake(),
@@ -22,6 +26,7 @@ func newTestMux(cfg *config.Config) *http.ServeMux {
 		fakes.NewDirectoryFake(),
 		fakes.NewVerifierFake(),
 		fakes.NewBlocklistStoreFake(),
+		httpadapter.NewDomainLimiters(1000, 1000),
 		cfg,
 	)
 }

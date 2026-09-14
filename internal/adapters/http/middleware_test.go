@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"cdamp/internal/app"
 	"cdamp/internal/domain"
@@ -147,6 +148,73 @@ func TestSizeLimitMiddlewareAllowsBodyAtLimit(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+}
+
+func TestDomainLimiters_AllowsUnderLimit(t *testing.T) {
+	d := NewDomainLimiters(1000, 1000)
+	if !d.Allow("a.dev") {
+		t.Fatalf("Allow(%q) = false, want true under a generous rate/burst", "a.dev")
+	}
+}
+
+func TestDomainLimiters_BlocksOverLimit(t *testing.T) {
+	// rps=0, burst=1: no refill at all, so exactly one token ever exists
+	// -- deterministic without any time.Sleep/real-clock wait.
+	d := NewDomainLimiters(0, 1)
+	if !d.Allow("a.dev") {
+		t.Fatalf("first Allow(%q) = false, want true", "a.dev")
+	}
+	if d.Allow("a.dev") {
+		t.Fatalf("second Allow(%q) = true, want false (bucket should be exhausted)", "a.dev")
+	}
+}
+
+func TestDomainLimiters_DomainsAreIndependent(t *testing.T) {
+	d := NewDomainLimiters(0, 1)
+	if !d.Allow("a.dev") {
+		t.Fatalf("Allow(%q) = false, want true", "a.dev")
+	}
+	if d.Allow("a.dev") {
+		t.Fatalf("second Allow(%q) = true, want false (bucket should be exhausted)", "a.dev")
+	}
+	if !d.Allow("b.dev") {
+		t.Fatalf("Allow(%q) = false, want true (independent bucket from a.dev)", "b.dev")
+	}
+}
+
+func TestDomainLimiters_SweepEvictsOnlyIdleEntries(t *testing.T) {
+	d := NewDomainLimiters(1000, 1000)
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	now := t0
+	d.now = func() time.Time { return now }
+
+	d.Allow("idle.dev")
+	d.Allow("active.dev")
+
+	// Refresh active.dev's lastSeen partway through the TTL window.
+	now = t0.Add(domainLimiterTTL / 2)
+	d.Allow("active.dev")
+
+	// Advance past the TTL for idle.dev (whose lastSeen is still t0), but
+	// still within the TTL of active.dev's refreshed lastSeen.
+	now = t0.Add(domainLimiterTTL + time.Second)
+	d.sweep()
+
+	d.mu.Lock()
+	_, idleStillPresent := d.limiters["idle.dev"]
+	_, activeStillPresent := d.limiters["active.dev"]
+	remaining := len(d.limiters)
+	d.mu.Unlock()
+
+	if idleStillPresent {
+		t.Errorf("idle.dev entry still present after sweep, want evicted")
+	}
+	if !activeStillPresent {
+		t.Errorf("active.dev entry evicted after sweep, want retained (refreshed lastSeen)")
+	}
+	if remaining != 1 {
+		t.Errorf("limiters map has %d entries after sweep, want 1", remaining)
 	}
 }
 

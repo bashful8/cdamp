@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	"cdamp/internal/app"
 	"cdamp/internal/domain"
@@ -142,4 +146,94 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// domainLimiterTTL bounds how long an idle per-domain rate limiter is
+// kept before a cleanup sweep evicts it. See STATUS.md's Phase 8 task 2
+// spec, design decision 6, for why this exists and why these two
+// constants (not pinned by any doc) were chosen at these values.
+const domainLimiterTTL = 10 * time.Minute
+
+// domainLimiterSweepInterval is how often the background cleanup
+// goroutine (Run) scans for idle entries to evict.
+const domainLimiterSweepInterval = time.Minute
+
+// DomainLimiters is a concurrency-safe registry of one
+// golang.org/x/time/rate.Limiter per sender domain, implementing
+// 01-PROTOCOL.md/03-API.md's per-domain token bucket on POST /deliver
+// (429 rate_limited). Exported so cmd/cdampd/main.go can construct one
+// at startup and run its cleanup loop (Run) the same way it already
+// runs delivery.Worker.Run.
+type DomainLimiters struct {
+	mu       sync.Mutex
+	rps      float64
+	burst    int
+	limiters map[string]*limiterEntry
+	now      func() time.Time // overridable in this package's own tests; always time.Now outside tests
+}
+
+type limiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// NewDomainLimiters returns a DomainLimiters using rps/burst already
+// resolved from config (cfg.RateLimit.PerDomainRPS/.Burst) by the
+// caller, matching every other adapter constructor in this codebase
+// that takes specific resolved fields rather than *config.Config
+// itself (e.g. delivery.NewWorker's cfg.RetrySchedule parameter).
+func NewDomainLimiters(rps float64, burst int) *DomainLimiters {
+	return &DomainLimiters{
+		rps:      rps,
+		burst:    burst,
+		limiters: make(map[string]*limiterEntry),
+		now:      time.Now,
+	}
+}
+
+// Allow reports whether a request from domainName is within its
+// per-domain token bucket, lazily creating a fresh limiter (starting
+// full, at burst capacity) the first time a domain is seen.
+func (d *DomainLimiters) Allow(domainName string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e, ok := d.limiters[domainName]
+	if !ok {
+		e = &limiterEntry{limiter: rate.NewLimiter(rate.Limit(d.rps), d.burst)}
+		d.limiters[domainName] = e
+	}
+	e.lastSeen = d.now()
+	return e.limiter.Allow()
+}
+
+// sweep evicts every tracked domain whose lastSeen is older than
+// domainLimiterTTL. Unexported, but this package's own tests call it
+// directly with d.now stubbed, so eviction is tested deterministically
+// without waiting on Run's real ticker.
+func (d *DomainLimiters) sweep() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cutoff := d.now().Add(-domainLimiterTTL)
+	for k, e := range d.limiters {
+		if e.lastSeen.Before(cutoff) {
+			delete(d.limiters, k)
+		}
+	}
+}
+
+// Run ticks every domainLimiterSweepInterval calling sweep, until ctx
+// is canceled -- same lifecycle shape as delivery.Worker.Run; main.go
+// starts it the same way (go limiters.Run(ctx)) alongside the existing
+// worker, stopping on the same shutdown signal.
+func (d *DomainLimiters) Run(ctx context.Context) {
+	ticker := time.NewTicker(domainLimiterSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			d.sweep()
+		}
+	}
 }
