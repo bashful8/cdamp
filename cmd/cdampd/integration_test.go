@@ -236,7 +236,7 @@ func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTP
 	deliveryClient := delivery.NewClient(signer, deliveryHTTPClient)
 	worker := delivery.NewWorker(store, dir, deliveryClient, cfg.RetrySchedule)
 
-	mux := newMux(store, store, dir, verifier, cfg)
+	mux := newMux(store, store, dir, verifier, store, cfg)
 
 	// io.Discard: this test asserts on message/store state, not log
 	// output, and letting every instance log to the test's real stdout

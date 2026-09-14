@@ -21,6 +21,7 @@ func newTestMux(cfg *config.Config) *http.ServeMux {
 		fakes.NewSigningKeyStoreFake(),
 		fakes.NewDirectoryFake(),
 		fakes.NewVerifierFake(),
+		fakes.NewBlocklistStoreFake(),
 		cfg,
 	)
 }

@@ -1,8 +1,11 @@
 package http
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"cdamp/internal/app"
@@ -26,14 +29,54 @@ func NewFederationMux(
 	keys domain.SigningKeyStore,
 	directory domain.Directory,
 	verifier domain.Verifier,
+	blocklist domain.BlocklistStore,
 	cfg *config.Config,
 ) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /.well-known/cdamp/{agent}", handleWellKnownAgent(store, keys, cfg))
 	mux.HandleFunc("GET /.well-known/cdamp/keys", handleWellKnownKeys(keys, cfg))
-	mux.HandleFunc("POST /deliver", handleDeliver(store, directory, verifier))
+	mux.HandleFunc("POST /deliver", handleDeliver(store, directory, verifier, blocklist))
 
 	return sizeLimitMiddleware(mux)
+}
+
+// senderDomain returns the domain part of a "<name>@<domain>" address, or
+// "" if addr has no "@". Mirrors internal/app/receive_message.go's own
+// unexported domainPart exactly -- duplicated here rather than imported
+// because domainPart is unexported in a different package; see this
+// task's spec in STATUS.md, design decision 4, for why a small
+// package-local helper (not a cross-adapter import) is the established
+// pattern (internal/adapters/directory's splitAddress is the existing
+// precedent for a different, stricter, package-local variant).
+func senderDomain(addr string) string {
+	if i := strings.LastIndex(addr, "@"); i >= 0 {
+		return addr[i+1:]
+	}
+	return ""
+}
+
+// isDomainBlocklisted checks domainName against every domain_blocklist
+// entry via one BlocklistStore.ListBlocklist call -- a full-table
+// in-process scan, not a point lookup. See this task's spec in
+// STATUS.md, design decision 1, for why no new point-lookup port method
+// was added for this. domainName == "" (a malformed/absent sender
+// address) always returns false, nil -- app.ReceiveMessage's own
+// existing field validation is what rejects a malformed "from", not this
+// check (design decision 5).
+func isDomainBlocklisted(ctx context.Context, blocklist domain.BlocklistStore, domainName string) (bool, error) {
+	if domainName == "" {
+		return false, nil
+	}
+	entries, err := blocklist.ListBlocklist(ctx)
+	if err != nil {
+		return false, fmt.Errorf("checking blocklist: %w", err)
+	}
+	for _, e := range entries {
+		if e.Domain == domainName {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // wellKnownAgentResponse is GET /.well-known/cdamp/{agent}'s response
@@ -161,16 +204,28 @@ type deliverEnvelope struct {
 	Payload        deliverPayload `json:"payload"`
 }
 
-// handleDeliver implements POST /deliver. Rate limiting and blocklist
-// enforcement (01-PROTOCOL.md's /deliver response codes 403/429) are not
-// built here — Phase 8's job, per STATUS.md's task 4 spec — so this
-// handler only decodes the envelope, calls app.ReceiveMessage, and maps
-// its result/errors to bad_request/internal_error/200.
-func handleDeliver(store domain.InboxStore, directory domain.Directory, verifier domain.Verifier) http.HandlerFunc {
+// handleDeliver implements POST /deliver. Blocklist enforcement
+// (01-PROTOCOL.md's /deliver response code 403 blocklisted) runs right
+// after the envelope is decoded and before app.ReceiveMessage is ever
+// called (Phase 8 task 1, STATUS.md). Rate limiting (429) is a separate,
+// not-yet-built Phase 8 task, so this handler still maps
+// app.ReceiveMessage's own result/errors to bad_request/internal_error/200.
+func handleDeliver(store domain.InboxStore, directory domain.Directory, verifier domain.Verifier, blocklist domain.BlocklistStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var env deliverEnvelope
 		if err := decodeJSONBody(w, r, &env); err != nil {
 			return // decodeJSONBody already wrote the error response
+		}
+
+		domainName := senderDomain(env.From)
+		blocked, err := isDomainBlocklisted(r.Context(), blocklist, domainName)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		if blocked {
+			writeError(w, http.StatusForbidden, "blocklisted", fmt.Sprintf("sender domain %q is blocklisted", domainName))
+			return
 		}
 
 		// id/timestamp are read straight off the wire, never re-derived:

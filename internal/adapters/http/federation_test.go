@@ -17,15 +17,44 @@ import (
 	"cdamp/internal/domain/fakes"
 )
 
-func newFederationTestMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.SigningKeyStoreFake, *fakes.DirectoryFake, *config.Config) {
+func newFederationTestMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.SigningKeyStoreFake, *fakes.DirectoryFake, *fakes.BlocklistStoreFake, *config.Config) {
 	t.Helper()
 	store := fakes.NewInboxStoreFake()
 	keys := fakes.NewSigningKeyStoreFake()
 	directory := fakes.NewDirectoryFake()
 	verifier := fakes.NewVerifierFake()
+	blocklist := fakes.NewBlocklistStoreFake()
 	cfg := &config.Config{Domain: "example.dev"}
-	mux := NewFederationMux(store, keys, directory, verifier, cfg)
-	return mux, store, keys, directory, cfg
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, cfg)
+	return mux, store, keys, directory, blocklist, cfg
+}
+
+// countingStore wraps *fakes.InboxStoreFake to count SaveMessage calls,
+// so a blocklist test can prove a blocked request never reaches
+// app.ReceiveMessage's own persistence step (Phase 8 task 1's testing
+// checklist).
+type countingStore struct {
+	*fakes.InboxStoreFake
+	saveMessageCalls int
+}
+
+func (s *countingStore) SaveMessage(ctx context.Context, m *domain.Message) error {
+	s.saveMessageCalls++
+	return s.InboxStoreFake.SaveMessage(ctx, m)
+}
+
+// countingBlocklistStore wraps *fakes.BlocklistStoreFake to count
+// ListBlocklist calls, so TestIsDomainBlocklisted can prove the
+// empty-domainName short-circuit (design decision 5) never calls the
+// store at all, not just that it returns false.
+type countingBlocklistStore struct {
+	*fakes.BlocklistStoreFake
+	listBlocklistCalls int
+}
+
+func (s *countingBlocklistStore) ListBlocklist(ctx context.Context) ([]*domain.BlocklistEntry, error) {
+	s.listBlocklistCalls++
+	return s.BlocklistStoreFake.ListBlocklist(ctx)
 }
 
 func seedActiveKey(keys *fakes.SigningKeyStoreFake, kid string) ed25519.PublicKey {
@@ -59,7 +88,7 @@ func doFederationPost(mux http.Handler, target string, body []byte) *httptest.Re
 }
 
 func TestWellKnownAgentSuccess(t *testing.T) {
-	mux, store, keys, _, cfg := newFederationTestMux(t)
+	mux, store, keys, _, _, cfg := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "alice"})
 	pub := seedActiveKey(keys, "k1")
 
@@ -93,7 +122,7 @@ func TestWellKnownAgentSuccess(t *testing.T) {
 }
 
 func TestWellKnownAgentNotFound(t *testing.T) {
-	mux, _, keys, _, _ := newFederationTestMux(t)
+	mux, _, keys, _, _, _ := newFederationTestMux(t)
 	seedActiveKey(keys, "k1")
 
 	rec := doFederationGet(mux, "/.well-known/cdamp/nobody")
@@ -101,7 +130,7 @@ func TestWellKnownAgentNotFound(t *testing.T) {
 }
 
 func TestWellKnownKeysNoPrevious(t *testing.T) {
-	mux, _, keys, _, _ := newFederationTestMux(t)
+	mux, _, keys, _, _, _ := newFederationTestMux(t)
 	seedActiveKey(keys, "k1")
 
 	rec := doFederationGet(mux, "/.well-known/cdamp/keys")
@@ -122,7 +151,7 @@ func TestWellKnownKeysNoPrevious(t *testing.T) {
 }
 
 func TestWellKnownKeysWithPreviousInGracePeriod(t *testing.T) {
-	mux, _, keys, _, _ := newFederationTestMux(t)
+	mux, _, keys, _, _, _ := newFederationTestMux(t)
 	seedActiveKey(keys, "k2")
 	seedActiveKey(keys, "k1") // will retire below
 	if err := keys.RetireSigningKey(context.Background(), "k1", time.Now().Add(24*time.Hour)); err != nil {
@@ -147,7 +176,7 @@ func TestWellKnownKeysWithPreviousInGracePeriod(t *testing.T) {
 }
 
 func TestWellKnownKeysWithExpiredPreviousOmitted(t *testing.T) {
-	mux, _, keys, _, _ := newFederationTestMux(t)
+	mux, _, keys, _, _, _ := newFederationTestMux(t)
 	seedActiveKey(keys, "k2")
 	seedActiveKey(keys, "k1")
 	if err := keys.RetireSigningKey(context.Background(), "k1", time.Now().Add(-24*time.Hour)); err != nil {
@@ -195,7 +224,7 @@ func validEnvelope(overrides map[string]any) []byte {
 }
 
 func TestDeliverHappyPathUnsigned(t *testing.T) {
-	mux, store, _, _, _ := newFederationTestMux(t)
+	mux, store, _, _, _, _ := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
 
 	body := validEnvelope(nil)
@@ -217,7 +246,7 @@ func TestDeliverHappyPathUnsigned(t *testing.T) {
 }
 
 func TestDeliverMissingFieldRejected(t *testing.T) {
-	mux, store, _, _, _ := newFederationTestMux(t)
+	mux, store, _, _, _, _ := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
 
 	body := validEnvelope(map[string]any{"subject": ""})
@@ -230,7 +259,7 @@ func TestDeliverMissingFieldRejected(t *testing.T) {
 }
 
 func TestDeliverBadVersionRejected(t *testing.T) {
-	mux, store, _, _, _ := newFederationTestMux(t)
+	mux, store, _, _, _, _ := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
 
 	body := validEnvelope(map[string]any{"version": "cdamp/9.9"})
@@ -243,7 +272,7 @@ func TestDeliverBadVersionRejected(t *testing.T) {
 }
 
 func TestDeliverUnresolvableRecipientRejected(t *testing.T) {
-	mux, _, _, _, _ := newFederationTestMux(t)
+	mux, _, _, _, _, _ := newFederationTestMux(t)
 	// no agent seeded at all
 
 	body := validEnvelope(nil)
@@ -252,7 +281,7 @@ func TestDeliverUnresolvableRecipientRejected(t *testing.T) {
 }
 
 func TestDeliverIdempotentRedelivery(t *testing.T) {
-	mux, store, _, _, _ := newFederationTestMux(t)
+	mux, store, _, _, _, _ := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
 
 	body := validEnvelope(map[string]any{"idempotency_key": "idk_abc123"})
@@ -272,7 +301,7 @@ func TestDeliverIdempotentRedelivery(t *testing.T) {
 }
 
 func TestDeliverOversizedBodyRejected(t *testing.T) {
-	mux, store, _, _, _ := newFederationTestMux(t)
+	mux, store, _, _, _, _ := newFederationTestMux(t)
 	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
 
 	oversized := validEnvelope(map[string]any{
@@ -284,4 +313,117 @@ func TestDeliverOversizedBodyRejected(t *testing.T) {
 	})
 	rec := doFederationPost(mux, "/deliver", oversized)
 	assertErrorResponse(t, rec, http.StatusBadRequest, "body_too_large")
+}
+
+func TestHandleDeliver_BlocklistedSenderDomainReturns403(t *testing.T) {
+	inner := fakes.NewInboxStoreFake()
+	inner.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
+	store := &countingStore{InboxStoreFake: inner}
+	keys := fakes.NewSigningKeyStoreFake()
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+	blocklist := fakes.NewBlocklistStoreFake()
+	if err := blocklist.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{Domain: "other.dev", Reason: "spam"}); err != nil {
+		t.Fatalf("SaveBlocklistEntry: %v", err)
+	}
+	cfg := &config.Config{Domain: "example.dev"}
+	mux := NewFederationMux(store, keys, directory, verifier, blocklist, cfg)
+
+	// validEnvelope's default "from" is "researcher@other.dev" — the
+	// blocklisted domain seeded above.
+	body := validEnvelope(nil)
+	rec := doFederationPost(mux, "/deliver", body)
+	assertErrorResponse(t, rec, http.StatusForbidden, "blocklisted")
+
+	if store.saveMessageCalls != 0 {
+		t.Fatalf("SaveMessage calls = %d, want 0 (blocked request must never reach persistence)", store.saveMessageCalls)
+	}
+}
+
+func TestHandleDeliver_NonBlocklistedSenderDomainProceedsNormally(t *testing.T) {
+	mux, store, _, _, blocklist, _ := newFederationTestMux(t)
+	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
+	if err := blocklist.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{Domain: "unrelated.dev", Reason: "spam"}); err != nil {
+		t.Fatalf("SaveBlocklistEntry: %v", err)
+	}
+
+	// validEnvelope's default "from" is "researcher@other.dev", which is
+	// not the blocklisted domain seeded above.
+	body := validEnvelope(nil)
+	rec := doFederationPost(mux, "/deliver", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	if _, err := store.GetMessage(context.Background(), "msg_1757683200_a1b2c3"); err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+}
+
+func TestHandleDeliver_EmptyBlocklistNeverBlocks(t *testing.T) {
+	mux, store, _, _, _, _ := newFederationTestMux(t)
+	store.AddAgent(&domain.Agent{ID: 1, Name: "bob"})
+
+	body := validEnvelope(nil)
+	rec := doFederationPost(mux, "/deliver", body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIsDomainBlocklisted(t *testing.T) {
+	tests := []struct {
+		name       string
+		seed       []string
+		domainName string
+		want       bool
+	}{
+		{name: "domain present", seed: []string{"bad.dev"}, domainName: "bad.dev", want: true},
+		{name: "domain absent", seed: []string{"bad.dev"}, domainName: "good.dev", want: false},
+		{name: "empty domainName", seed: []string{"bad.dev"}, domainName: "", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := fakes.NewBlocklistStoreFake()
+			for _, d := range tt.seed {
+				if err := inner.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{Domain: d, Reason: "spam"}); err != nil {
+					t.Fatalf("SaveBlocklistEntry: %v", err)
+				}
+			}
+			blocklist := &countingBlocklistStore{BlocklistStoreFake: inner}
+
+			got, err := isDomainBlocklisted(context.Background(), blocklist, tt.domainName)
+			if err != nil {
+				t.Fatalf("isDomainBlocklisted: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("isDomainBlocklisted(%q) = %v, want %v", tt.domainName, got, tt.want)
+			}
+
+			if tt.domainName == "" {
+				if blocklist.listBlocklistCalls != 0 {
+					t.Fatalf("ListBlocklist calls = %d, want 0 for empty domainName (short-circuit)", blocklist.listBlocklistCalls)
+				}
+			}
+		})
+	}
+}
+
+func TestSenderDomain(t *testing.T) {
+	tests := []struct {
+		addr string
+		want string
+	}{
+		{addr: "a@b.dev", want: "b.dev"},
+		{addr: "noatsign", want: ""},
+		{addr: "", want: ""},
+		{addr: "a@b@c.dev", want: "c.dev"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.addr, func(t *testing.T) {
+			if got := senderDomain(tt.addr); got != tt.want {
+				t.Fatalf("senderDomain(%q) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
 }
