@@ -82,6 +82,8 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	rotator := signing.NewRotator(store, signer, cfg.SigningKeyPassphrase, cfg.KeyRotationGrace)
 
+	archiver := sqlite.NewArchiver(store, cfg.ArchiveAfter)
+
 	adminToken, created, err := app.BootstrapAdminCredential(context.Background(), store)
 	if err != nil {
 		return fmt.Errorf("bootstrapping admin credential: %w", err)
@@ -141,6 +143,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 
 	go worker.Run(ctx)   // stops when ctx is canceled by the same shutdown signal
 	go limiters.Run(ctx) // same shutdown-signal-driven lifecycle as the worker
+	go archiver.Run(ctx) // same shutdown-signal-driven lifecycle as worker/limiters
 
 	go func() {
 		logger.Info("http server listening", "addr", cfg.ListenAddr)

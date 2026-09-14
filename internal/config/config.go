@@ -162,6 +162,17 @@ const (
 	defaultBurst        = 20
 )
 
+// defaultArchiveAfter is applied by Load when an operator's config file
+// omits archive_after entirely (parses to a zero time.Duration -- see
+// parseDuration's own "empty string yields a zero duration" comment).
+// Without this default, an unset archive_after would make Archiver
+// (internal/adapters/storage/sqlite/archive.go) treat every read message
+// as immediately archivable (cutoff = now - 0 = now) the moment archival
+// first runs -- see STATUS.md's Phase 8 task 4 spec, design decision 2.
+// 2160h (90 days) matches 02-ARCHITECTURE.md's own example config value
+// exactly, mirroring defaultPerDomainRPS/defaultBurst's technique below.
+const defaultArchiveAfter = 2160 * time.Hour
+
 // Load reads the YAML config file at path, applies CDAMPD_*-style
 // environment variable overrides on top of it, then resolves the
 // signing-key passphrase from the environment variable named by
@@ -192,6 +203,13 @@ func Load(path string) (*Config, error) {
 	if cfg.RateLimit.PerDomainRPS == 0 && cfg.RateLimit.Burst == 0 {
 		cfg.RateLimit.PerDomainRPS = defaultPerDomainRPS
 		cfg.RateLimit.Burst = defaultBurst
+	}
+
+	// An operator who omits archive_after gets 90 days, not "archive
+	// everything immediately" -- see defaultArchiveAfter's doc comment /
+	// STATUS.md's Phase 8 task 4 spec, design decision 2.
+	if cfg.ArchiveAfter == 0 {
+		cfg.ArchiveAfter = defaultArchiveAfter
 	}
 
 	// Never stored in the YAML file itself: resolved from whichever env

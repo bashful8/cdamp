@@ -6,6 +6,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -61,9 +62,28 @@ func qualifiedMessageColumns(alias string) string {
 const sqliteConstraintUniqueCode = 2067
 
 // Store implements domain.InboxStore on top of a single SQLite file opened
-// via modernc.org/sqlite (pure Go, no cgo).
+// via modernc.org/sqlite (pure Go, no cgo), plus a second archive.db file
+// used for reads only -- see archive.go's Archiver for how rows actually
+// move into it.
 type Store struct {
 	db *sql.DB
+
+	// archiveDB is a second, independently-opened *sql.DB against the
+	// separate archive.db file (archiveDBPath) -- used only by the read
+	// methods below, which query it as a plain, unattached database,
+	// never inside the same transaction as db. Archiver (archive.go)
+	// writes to archive.db through a completely different path -- a
+	// short-lived connection borrowed from db's own pool with archive.db
+	// ATTACHed -- so the two databases can be moved between atomically.
+	// See STATUS.md's Phase 8 task 4 spec, design decision 3/8, for why
+	// archiveDB itself is never used for writes.
+	archiveDB *sql.DB
+
+	// archivePath is archiveDB's file path, kept so Archiver
+	// (constructed with a *Store, same-package field access, same
+	// precedent as signing.Rotator holding a *Ed25519Signer) can ATTACH
+	// it by path without re-deriving it.
+	archivePath string
 }
 
 // Compile-time assertion that *Store satisfies domain.InboxStore in full.
@@ -131,12 +151,37 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrating sqlite database %s: %w", path, err)
 	}
 
-	return &Store{db: db}, nil
+	// archive.db: a second, independent database file alongside path,
+	// opened with the same WAL/busy-timeout/foreign-keys pragmas but
+	// without _txlock=immediate -- this *sql.DB is only ever used for
+	// reads (see Store.archiveDB's doc comment); Archiver never writes
+	// through it. Its schema is created here, once, idempotently, via
+	// plain DDL rather than golang-migrate -- see STATUS.md's Phase 8
+	// task 4 spec, design decision 3.
+	archivePath := archiveDBPath(path)
+	archiveDSN := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", archivePath)
+	archiveDB, err := sql.Open("sqlite", archiveDSN)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("opening archive sqlite database %s: %w", archivePath, err)
+	}
+	if err := archiveDB.Ping(); err != nil {
+		db.Close()
+		archiveDB.Close()
+		return nil, fmt.Errorf("connecting to archive sqlite database %s: %w", archivePath, err)
+	}
+	if err := ensureArchiveSchema(archiveDB); err != nil {
+		db.Close()
+		archiveDB.Close()
+		return nil, fmt.Errorf("preparing archive sqlite database %s: %w", archivePath, err)
+	}
+
+	return &Store{db: db, archiveDB: archiveDB, archivePath: archivePath}, nil
 }
 
-// Close closes the underlying database connection.
+// Close closes both the main and archive database connections.
 func (s *Store) Close() error {
-	return s.db.Close()
+	return errors.Join(s.db.Close(), s.archiveDB.Close())
 }
 
 // runMigrations applies every embedded migration under migrations/ that
@@ -218,10 +263,27 @@ func (s *Store) SaveMessage(ctx context.Context, m *domain.Message) error {
 	return nil
 }
 
-// GetMessage returns the message with the given id, or domain.ErrNotFound
-// if no such message exists.
+// GetMessage returns the message with the given id, checking the live
+// database first and archive.db second (a message lives in exactly one
+// of the two, never both, but which one isn't known ahead of the
+// lookup) -- per 03-API.md's schema section's boundary-spanning-read
+// rule. Returns domain.ErrNotFound if id exists in neither.
 func (s *Store) GetMessage(ctx context.Context, id string) (*domain.Message, error) {
-	row := s.db.QueryRowContext(ctx, "SELECT "+messageColumns+" FROM messages WHERE id = ?", id)
+	m, err := getMessageFrom(ctx, s.db, id)
+	if err == nil {
+		return m, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		return nil, err
+	}
+
+	return getMessageFrom(ctx, s.archiveDB, id)
+}
+
+// getMessageFrom runs GetMessage's query against db, whichever of
+// s.db/s.archiveDB the caller passes.
+func getMessageFrom(ctx context.Context, db *sql.DB, id string) (*domain.Message, error) {
+	row := db.QueryRowContext(ctx, "SELECT "+messageColumns+" FROM messages WHERE id = ?", id)
 	m, err := scanMessage(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -232,34 +294,60 @@ func (s *Store) GetMessage(ctx context.Context, id string) (*domain.Message, err
 	return m, nil
 }
 
-// GetThread returns the thread with the given id and every message in it,
-// ordered by sent_at (then id, to break ties deterministically), per
-// 03-API.md's `GET /threads/{id}` spec. Returns domain.ErrNotFound if no
-// such thread exists.
+// GetThread returns the thread with the given id and every message in
+// it, across both databases -- see STATUS.md's Phase 8 task 4 spec,
+// design decision 9. The thread row is always read from main (threads
+// never move); its messages may be split across main and archive.db, so
+// both are queried and merged, ordered by (sent_at, id) exactly as
+// before. Returns domain.ErrNotFound if no such thread exists.
 func (s *Store) GetThread(ctx context.Context, id string) (*domain.Thread, []*domain.Message, error) {
+	thread, err := threadByID(ctx, s.db, id)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mainMessages, err := threadMessagesFrom(ctx, s.db, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("getting thread %s: %w", id, err)
+	}
+	archiveMessages, err := threadMessagesFrom(ctx, s.archiveDB, id)
+	if err != nil {
+		return nil, nil, fmt.Errorf("getting thread %s: checking archive: %w", id, err)
+	}
+
+	// No cap: 03-API.md's GET /threads/{id} doc says a full thread fetch
+	// needs no pagination at realistic thread lengths, unchanged here.
+	messages := mergeMessagesSorted(0, mainMessages, archiveMessages)
+	return thread, messages, nil
+}
+
+// threadByID returns the thread with the given id from db, or
+// domain.ErrNotFound if none exists. Every call site in this file passes
+// s.db -- threads always live in main (design decision 9).
+func threadByID(ctx context.Context, db *sql.DB, id string) (*domain.Thread, error) {
 	var (
 		threadID  string
 		subject   string
 		createdAt int64
 	)
-	err := s.db.QueryRowContext(ctx, "SELECT id, subject, created_at FROM threads WHERE id = ?", id).
+	err := db.QueryRowContext(ctx, "SELECT id, subject, created_at FROM threads WHERE id = ?", id).
 		Scan(&threadID, &subject, &createdAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, domain.ErrNotFound
+			return nil, domain.ErrNotFound
 		}
-		return nil, nil, fmt.Errorf("getting thread %s: %w", id, err)
+		return nil, fmt.Errorf("getting thread %s: %w", id, err)
 	}
-	thread := &domain.Thread{
-		ID:        threadID,
-		Subject:   subject,
-		CreatedAt: time.Unix(createdAt, 0).UTC(),
-	}
+	return &domain.Thread{ID: threadID, Subject: subject, CreatedAt: time.Unix(createdAt, 0).UTC()}, nil
+}
 
-	rows, err := s.db.QueryContext(ctx,
-		"SELECT "+messageColumns+" FROM messages WHERE thread_id = ? ORDER BY sent_at, id", id)
+// threadMessagesFrom returns every message with the given thread_id in
+// db, ordered by (sent_at, id).
+func threadMessagesFrom(ctx context.Context, db *sql.DB, threadID string) ([]*domain.Message, error) {
+	rows, err := db.QueryContext(ctx,
+		"SELECT "+messageColumns+" FROM messages WHERE thread_id = ? ORDER BY sent_at, id", threadID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("getting thread %s: listing messages: %w", id, err)
+		return nil, fmt.Errorf("listing messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -267,15 +355,50 @@ func (s *Store) GetThread(ctx context.Context, id string) (*domain.Thread, []*do
 	for rows.Next() {
 		m, err := scanMessage(rows)
 		if err != nil {
-			return nil, nil, fmt.Errorf("getting thread %s: scanning message: %w", id, err)
+			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		messages = append(messages, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("getting thread %s: iterating messages: %w", id, err)
+		return nil, fmt.Errorf("iterating messages: %w", err)
 	}
+	return messages, nil
+}
 
-	return thread, messages, nil
+// mergeMessagesSorted concatenates every slice in groups, sorts by
+// (SentAt, ID) -- the same total order every existing query already
+// used -- and, if limit > 0, truncates to the first limit entries. Used
+// by GetThread (limit 0, no cap) and ListMessages (limit = the resolved
+// page size) -- see STATUS.md's Phase 8 task 4 spec, design decision 10,
+// for the top-k-per-partition correctness argument ListMessages' use
+// relies on.
+func mergeMessagesSorted(limit int, groups ...[]*domain.Message) []*domain.Message {
+	var merged []*domain.Message
+	for _, g := range groups {
+		merged = append(merged, g...)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].SentAt.Equal(merged[j].SentAt) {
+			return merged[i].ID < merged[j].ID
+		}
+		return merged[i].SentAt.Before(merged[j].SentAt)
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
+}
+
+// clampLimit applies 03-API.md's default-50/max-200 page-size rule,
+// shared by ListMessages and SearchThreads.
+func clampLimit(limit int) int {
+	if limit <= 0 {
+		return 50
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
 }
 
 // ListMessages returns messages matching f, always scoped to f.AgentID and
@@ -299,32 +422,60 @@ func (s *Store) GetThread(ctx context.Context, id string) (*domain.Thread, []*do
 // falls back to the plain indexed scan already used for every other
 // filter combination.
 func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*domain.Message, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 200 {
-		limit = 200
+	limit := clampLimit(f.Limit)
+
+	var (
+		afterSentAt int64
+		afterID     string
+	)
+	hasAfter := f.After != ""
+	if hasAfter {
+		cursor, err := getMessageFrom(ctx, s.db, f.After)
+		if errors.Is(err, domain.ErrNotFound) {
+			cursor, err = getMessageFrom(ctx, s.archiveDB, f.After)
+		}
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				// Mirrors the pre-archival behavior exactly -- see
+				// STATUS.md's Phase 8 task 4 spec, design decision 10.
+				return nil, nil
+			}
+			return nil, fmt.Errorf("listing messages: resolving cursor %s: %w", f.After, err)
+		}
+		afterSentAt, afterID = cursor.SentAt.Unix(), cursor.ID
 	}
 
+	mainMessages, err := listMessagesFrom(ctx, s.db, f, afterSentAt, afterID, hasAfter, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listing messages: %w", err)
+	}
+	archiveMessages, err := listMessagesFrom(ctx, s.archiveDB, f, afterSentAt, afterID, hasAfter, limit)
+	if err != nil {
+		return nil, fmt.Errorf("listing messages: checking archive: %w", err)
+	}
+
+	return mergeMessagesSorted(limit, mainMessages, archiveMessages), nil
+}
+
+// listMessagesFrom runs ListMessages' filter-building/query logic against
+// db. The After cursor is applied as two literal bound values,
+// "(sent_at, id) > (?, ?)", rather than the pre-archival version's
+// correlated subquery -- necessary because the cursor row may live in the
+// *other* database from the one being queried here. afterSentAt/afterID/
+// hasAfter come pre-resolved from ListMessages, which looks the cursor
+// row up once, not per side.
+func listMessagesFrom(ctx context.Context, db *sql.DB, f domain.MessageFilter, afterSentAt int64, afterID string, hasAfter bool, limit int) ([]*domain.Message, error) {
 	from := "messages"
 	cols := messageColumns
 	where := []string{"agent_id = ?"}
 	args := []any{f.AgentID}
 
 	if f.Query != "" {
-		// agent_id/from_addr/thread_id/status/read/sent_at/id all exist
-		// only on messages, never on messages_fts (whose columns are just
-		// subject, body, plus the implicit rowid/rank) — so referencing
-		// them unqualified stays unambiguous even under this join, and
-		// only the SELECT list (messageColumns, which does include
-		// subject/body) needs table-qualifying.
 		from = "messages m JOIN messages_fts ON messages_fts.rowid = m.rowid"
 		cols = qualifiedMessageColumns("m")
 		where = append(where, "messages_fts MATCH ?")
 		args = append(args, f.Query)
 	}
-
 	if f.From != "" {
 		where = append(where, "from_addr = ?")
 		args = append(args, f.From)
@@ -340,18 +491,18 @@ func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*do
 	if f.Unread {
 		where = append(where, "read = 0")
 	}
-	if f.After != "" {
-		where = append(where, "(sent_at, id) > (SELECT sent_at, id FROM messages WHERE id = ?)")
-		args = append(args, f.After)
+	if hasAfter {
+		where = append(where, "(sent_at, id) > (?, ?)")
+		args = append(args, afterSentAt, afterID)
 	}
 
 	query := "SELECT " + cols + " FROM " + from + " WHERE " + strings.Join(where, " AND ") +
 		" ORDER BY sent_at, id LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("listing messages: %w", err)
+		return nil, fmt.Errorf("querying messages: %w", err)
 	}
 	defer rows.Close()
 
@@ -359,12 +510,12 @@ func (s *Store) ListMessages(ctx context.Context, f domain.MessageFilter) ([]*do
 	for rows.Next() {
 		m, err := scanMessage(rows)
 		if err != nil {
-			return nil, fmt.Errorf("listing messages: scanning message: %w", err)
+			return nil, fmt.Errorf("scanning message: %w", err)
 		}
 		messages = append(messages, m)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("listing messages: iterating messages: %w", err)
+		return nil, fmt.Errorf("iterating messages: %w", err)
 	}
 
 	return messages, nil
@@ -570,14 +721,83 @@ func (s *Store) FindByIdempotencyKey(ctx context.Context, key string) (*domain.M
 // message for agentID, mirroring ListMessages' handling of an empty
 // f.Query.
 func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, f domain.ThreadFilter) ([]*domain.Thread, error) {
-	limit := f.Limit
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 200 {
-		limit = 200
+	limit := clampLimit(f.Limit)
+
+	var afterCreatedAt int64
+	var afterID string
+	hasAfter := f.After != ""
+	if hasAfter {
+		var createdAt int64
+		err := s.db.QueryRowContext(ctx, "SELECT created_at FROM threads WHERE id = ?", f.After).Scan(&createdAt)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil // mirrors ListMessages' precedent
+			}
+			return nil, fmt.Errorf("searching threads: resolving cursor %s: %w", f.After, err)
+		}
+		afterCreatedAt, afterID = createdAt, f.After
 	}
 
+	mainThreads, err := searchThreadsFrom(ctx, s.db, agentID, query, afterCreatedAt, afterID, hasAfter, limit)
+	if err != nil {
+		return nil, fmt.Errorf("searching threads: %w", err)
+	}
+
+	// Archive-side candidates: every distinct thread_id with a matching
+	// message in archive.db for this agent. Deliberately unbounded -- see
+	// STATUS.md's Phase 8 task 4 spec, design decision 10.
+	archiveThreadIDs, err := archiveMatchingThreadIDs(ctx, s.archiveDB, agentID, query)
+	if err != nil {
+		return nil, fmt.Errorf("searching threads: checking archive: %w", err)
+	}
+
+	seen := make(map[string]bool, len(mainThreads))
+	for _, t := range mainThreads {
+		seen[t.ID] = true
+	}
+
+	var extra []*domain.Thread
+	for _, tid := range archiveThreadIDs {
+		if seen[tid] {
+			continue
+		}
+		seen[tid] = true
+		t, err := threadByID(ctx, s.db, tid)
+		if err != nil {
+			if errors.Is(err, domain.ErrNotFound) {
+				// Defensive only -- see STATUS.md's Phase 8 task 4 spec,
+				// design decision 9/archiveOnce's thread mirroring.
+				continue
+			}
+			return nil, fmt.Errorf("searching threads: %w", err)
+		}
+		if hasAfter && !threadAfterCursor(t, afterCreatedAt, afterID) {
+			continue
+		}
+		extra = append(extra, t)
+	}
+
+	return mergeThreadsSorted(limit, mainThreads, extra), nil
+}
+
+// threadAfterCursor reports whether t sorts strictly after the resolved
+// (afterCreatedAt, afterID) cursor position, in the same (created_at, id)
+// order SearchThreads has always used -- applied in Go only for extra
+// (archive-only) candidates; searchThreadsFrom applies the equivalent
+// condition in SQL for main's own candidates.
+func threadAfterCursor(t *domain.Thread, afterCreatedAt int64, afterID string) bool {
+	ca := t.CreatedAt.Unix()
+	if ca != afterCreatedAt {
+		return ca > afterCreatedAt
+	}
+	return t.ID > afterID
+}
+
+// searchThreadsFrom runs SearchThreads' threads-JOIN-messages query
+// (unchanged in shape from the pre-archival version) against db, with the
+// after cursor applied as literal bound values, the same technique
+// listMessagesFrom uses and for the same reason.
+func searchThreadsFrom(ctx context.Context, db *sql.DB, agentID int64, query string, afterCreatedAt int64, afterID string, hasAfter bool, limit int) ([]*domain.Thread, error) {
 	from := "threads t JOIN messages m ON m.thread_id = t.id"
 	where := []string{"m.agent_id = ?"}
 	args := []any{agentID}
@@ -587,10 +807,9 @@ func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, 
 		where = append(where, "messages_fts MATCH ?")
 		args = append(args, query)
 	}
-
-	if f.After != "" {
-		where = append(where, "(t.created_at, t.id) > (SELECT created_at, id FROM threads WHERE id = ?)")
-		args = append(args, f.After)
+	if hasAfter {
+		where = append(where, "(t.created_at, t.id) > (?, ?)")
+		args = append(args, afterCreatedAt, afterID)
 	}
 
 	q := "SELECT DISTINCT t.id, t.subject, t.created_at FROM " + from +
@@ -598,9 +817,9 @@ func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, 
 		" ORDER BY t.created_at, t.id LIMIT ?"
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("searching threads: %w", err)
+		return nil, fmt.Errorf("querying threads: %w", err)
 	}
 	defer rows.Close()
 
@@ -611,7 +830,7 @@ func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, 
 			createdAt   int64
 		)
 		if err := rows.Scan(&id, &subject, &createdAt); err != nil {
-			return nil, fmt.Errorf("searching threads: scanning thread: %w", err)
+			return nil, fmt.Errorf("scanning thread: %w", err)
 		}
 		threads = append(threads, &domain.Thread{
 			ID:        id,
@@ -620,10 +839,62 @@ func (s *Store) SearchThreads(ctx context.Context, agentID int64, query string, 
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("searching threads: iterating threads: %w", err)
+		return nil, fmt.Errorf("iterating threads: %w", err)
 	}
 
 	return threads, nil
+}
+
+// archiveMatchingThreadIDs returns every distinct thread_id among
+// archiveDB's messages belonging to agentID (and, if query is non-empty,
+// matching it via messages_fts).
+func archiveMatchingThreadIDs(ctx context.Context, archiveDB *sql.DB, agentID int64, query string) ([]string, error) {
+	from := "messages"
+	where := "agent_id = ?"
+	args := []any{agentID}
+
+	if query != "" {
+		from = "messages m JOIN messages_fts ON messages_fts.rowid = m.rowid"
+		where = "agent_id = ? AND messages_fts MATCH ?"
+		args = append(args, query)
+	}
+
+	rows, err := archiveDB.QueryContext(ctx, "SELECT DISTINCT thread_id FROM "+from+" WHERE "+where, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying archive thread ids: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scanning archive thread id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating archive thread ids: %w", err)
+	}
+	return ids, nil
+}
+
+// mergeThreadsSorted concatenates main and extra, sorts by (CreatedAt,
+// ID), and caps to limit.
+func mergeThreadsSorted(limit int, main, extra []*domain.Thread) []*domain.Thread {
+	merged := make([]*domain.Thread, 0, len(main)+len(extra))
+	merged = append(merged, main...)
+	merged = append(merged, extra...)
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].CreatedAt.Equal(merged[j].CreatedAt) {
+			return merged[i].ID < merged[j].ID
+		}
+		return merged[i].CreatedAt.Before(merged[j].CreatedAt)
+	})
+	if limit > 0 && len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 // GetAgentByID returns the agent with the given id, or domain.ErrNotFound

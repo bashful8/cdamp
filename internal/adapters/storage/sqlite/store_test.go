@@ -947,6 +947,374 @@ func TestListAgentsEmpty(t *testing.T) {
 	}
 }
 
+func TestOpenCreatesArchiveSchema(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "fresh.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	defer s.Close()
+
+	wantTables := []string{"threads", "messages", "messages_fts"}
+	for _, table := range wantTables {
+		var name string
+		err := s.archiveDB.QueryRow("SELECT name FROM sqlite_master WHERE type IN ('table') AND name = ?", table).Scan(&name)
+		if err != nil {
+			t.Errorf("archive table %q missing after Open: %v", table, err)
+		}
+	}
+
+	wantTriggers := []string{"messages_ai", "messages_ad", "messages_au"}
+	for _, trig := range wantTriggers {
+		var name string
+		err := s.archiveDB.QueryRow("SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = ?", trig).Scan(&name)
+		if err != nil {
+			t.Errorf("archive trigger %q missing after Open: %v", trig, err)
+		}
+	}
+
+	// Re-opening an already-schema'd archive database must be a clean
+	// no-op, not an error (idempotent ensureArchiveSchema).
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-opening already-schema'd database: %v", err)
+	}
+	defer s2.Close()
+}
+
+func TestCloseClosesBothDatabases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.db")
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open(%q): %v", path, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := s.db.Ping(); err == nil {
+		t.Errorf("s.db still accepts queries after Close")
+	}
+	if err := s.archiveDB.Ping(); err == nil {
+		t.Errorf("s.archiveDB still accepts queries after Close")
+	}
+}
+
+// seedFullyArchivedMessage simulates what Archiver's archiveOnce actually
+// does to a message that ages past the archive threshold: first saves m
+// through the normal SaveMessage path (so its thread row exists in
+// main.threads, exactly as design decision 9 requires -- a thread's row is
+// created only by SaveMessage and is never deleted, so any archived
+// message's owning thread is always still resolvable from main), then
+// removes m from main.messages and inserts the equivalent row directly into
+// archive.db (bypassing Archiver itself, to isolate the read methods' own
+// merge logic from the mover job, per the Phase 8 task 4 spec's testing
+// checklist).
+func seedFullyArchivedMessage(t *testing.T, s *Store, m *domain.Message) {
+	t.Helper()
+	ctx := context.Background()
+
+	if err := s.SaveMessage(ctx, m); err != nil {
+		t.Fatalf("SaveMessage(%s): %v", m.ID, err)
+	}
+	if _, err := s.db.Exec("DELETE FROM messages WHERE id = ?", m.ID); err != nil {
+		t.Fatalf("removing %s from main.messages: %v", m.ID, err)
+	}
+	insertArchiveMessage(t, s, m)
+}
+
+// insertArchiveMessage inserts a message row directly into s.archiveDB,
+// bypassing Archiver entirely -- used to isolate the read methods' own
+// merge logic from the mover job, per the Phase 8 task 4 spec's testing
+// checklist. threadID's own row is inserted into archive.threads too (the
+// same structural-parity mirror Archiver performs), unless the caller has
+// already seeded it (INSERT OR IGNORE keeps this idempotent across
+// multiple calls for the same thread).
+func insertArchiveMessage(t *testing.T, s *Store, m *domain.Message) {
+	t.Helper()
+
+	if _, err := s.archiveDB.Exec(
+		"INSERT OR IGNORE INTO threads (id, subject, created_at) VALUES (?, ?, ?)",
+		m.ThreadID, m.Subject, m.SentAt.Unix(),
+	); err != nil {
+		t.Fatalf("seeding archive thread %s: %v", m.ThreadID, err)
+	}
+
+	_, err := s.archiveDB.Exec(`
+		INSERT INTO messages (
+			id, thread_id, agent_id, direction, from_addr, to_addr, sender_domain,
+			subject, body, priority, in_reply_to, idempotency_key, sent_at,
+			expires_at, trust, status, read, next_attempt, attempts, fail_reason
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+	`,
+		m.ID, m.ThreadID, m.AgentID, m.Direction, m.From, m.To, m.SenderDomain,
+		m.Subject, m.Body, m.Priority, toNullString(m.InReplyTo), toNullString(m.IdempotencyKey),
+		m.SentAt.Unix(), toNullUnix(m.ExpiresAt), m.Trust, m.Status, boolToInt(m.Read),
+		toNullUnix(m.NextAttempt), m.Attempts,
+	)
+	if err != nil {
+		t.Fatalf("seeding archive message %s: %v", m.ID, err)
+	}
+}
+
+func TestGetMessageChecksArchiveWhenNotInMain(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	m := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in",
+		From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "archived subject", Body: "archived body", Priority: "normal",
+		SentAt: mustTime(t, "2026-01-01T00:00:00Z"), Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, m)
+
+	got, err := s.GetMessage(ctx, "m1")
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if got.ID != "m1" || got.Subject != "archived subject" {
+		t.Errorf("GetMessage = %+v, want id=m1 subject=%q", got, "archived subject")
+	}
+}
+
+func TestGetMessageNotFoundInEitherDatabase(t *testing.T) {
+	s := newTestStore(t)
+
+	_, err := s.GetMessage(context.Background(), "no-such-id")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("GetMessage(missing) error = %v, want domain.ErrNotFound", err)
+	}
+}
+
+func TestGetThreadMergesMainAndArchiveMessages(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	base := mustTime(t, "2026-01-01T00:00:00Z")
+	main1 := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "thread subject", Body: "b1", Priority: "normal", SentAt: base, Trust: "verified", Status: "received",
+	}
+	if err := s.SaveMessage(ctx, main1); err != nil {
+		t.Fatalf("SaveMessage(main1): %v", err)
+	}
+	main2 := &domain.Message{
+		ID: "m3", ThreadID: "t1", AgentID: 1, Direction: "out", From: "me@local", To: "a@x", SenderDomain: "local",
+		Subject: "Re: thread subject", Body: "b3", Priority: "normal", SentAt: base.Add(2 * time.Minute), Trust: "verified", Status: "pending",
+	}
+	if err := s.SaveMessage(ctx, main2); err != nil {
+		t.Fatalf("SaveMessage(main2): %v", err)
+	}
+
+	archived := &domain.Message{
+		ID: "m2", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "thread subject", Body: "b2", Priority: "normal", SentAt: base.Add(time.Minute), Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, archived)
+
+	thread, messages, err := s.GetThread(ctx, "t1")
+	if err != nil {
+		t.Fatalf("GetThread: %v", err)
+	}
+	if thread.Subject != "thread subject" {
+		t.Errorf("thread.Subject = %q, want %q", thread.Subject, "thread subject")
+	}
+	if len(messages) != 3 {
+		t.Fatalf("len(messages) = %d, want 3", len(messages))
+	}
+	if messages[0].ID != "m1" || messages[1].ID != "m2" || messages[2].ID != "m3" {
+		t.Errorf("messages not correctly ordered across databases: got %v, want [m1 m2 m3]", ids(messages))
+	}
+}
+
+func TestListMessagesMergesMainAndArchiveResults(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	base := mustTime(t, "2026-01-01T00:00:00Z")
+	mainMsg := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "s1", Body: "b1", Priority: "normal", SentAt: base, Trust: "verified", Status: "received",
+	}
+	if err := s.SaveMessage(ctx, mainMsg); err != nil {
+		t.Fatalf("SaveMessage(mainMsg): %v", err)
+	}
+	archiveMsg := &domain.Message{
+		ID: "m2", ThreadID: "t2", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "s2", Body: "b2", Priority: "normal", SentAt: base.Add(time.Minute), Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, archiveMsg)
+
+	got, err := s.ListMessages(ctx, domain.MessageFilter{AgentID: 1})
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != "m1" || got[1].ID != "m2" {
+		t.Errorf("got %v, want [m1 m2]", ids(got))
+	}
+
+	t.Run("capped to limit", func(t *testing.T) {
+		got, err := s.ListMessages(ctx, domain.MessageFilter{AgentID: 1, Limit: 1})
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		if len(got) != 1 || got[0].ID != "m1" {
+			t.Errorf("got %v, want only m1", ids(got))
+		}
+	})
+}
+
+func TestListMessagesAfterCursorSpansBothDatabases(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	base := mustTime(t, "2026-01-01T00:00:00Z")
+	// Cursor row lives in archive.db; the next page's row lives in main.
+	cursorMsg := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "s1", Body: "b1", Priority: "normal", SentAt: base, Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, cursorMsg)
+
+	nextMsg := &domain.Message{
+		ID: "m2", ThreadID: "t2", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "s2", Body: "b2", Priority: "normal", SentAt: base.Add(time.Minute), Trust: "verified", Status: "received",
+	}
+	if err := s.SaveMessage(ctx, nextMsg); err != nil {
+		t.Fatalf("SaveMessage(nextMsg): %v", err)
+	}
+
+	got, err := s.ListMessages(ctx, domain.MessageFilter{AgentID: 1, After: "m1"})
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "m2" {
+		t.Errorf("got %v, want only m2 (page after archive-only cursor)", ids(got))
+	}
+}
+
+func TestListMessagesQueryMatchesArchivedMessages(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	archiveMsg := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "archived only", Body: "distinctive gizmo content", Priority: "normal",
+		SentAt: mustTime(t, "2026-01-01T00:00:00Z"), Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, archiveMsg)
+
+	got, err := s.ListMessages(ctx, domain.MessageFilter{AgentID: 1, Query: "gizmo"})
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "m1" {
+		t.Errorf("got %v, want only m1 (archive-only FTS match)", ids(got))
+	}
+}
+
+func TestSearchThreadsFindsArchiveOnlyMatch(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	archiveMsg := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "archive-only thread", Body: "narwhal migration notes", Priority: "normal",
+		SentAt: mustTime(t, "2026-01-01T00:00:00Z"), Trust: "verified", Status: "received", Read: true,
+	}
+	seedFullyArchivedMessage(t, s, archiveMsg)
+
+	got, err := s.SearchThreads(ctx, 1, "narwhal", domain.ThreadFilter{})
+	if err != nil {
+		t.Fatalf("SearchThreads: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "t1" {
+		t.Fatalf("got %v, want only t1", threadIDs(got))
+	}
+	if got[0].Subject != "archive-only thread" {
+		t.Errorf("got[0].Subject = %q, want %q (thread metadata must come from main)", got[0].Subject, "archive-only thread")
+	}
+}
+
+func TestSearchThreadsThreadWithMessagesInBothDatabasesAppearsOnce(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	base := mustTime(t, "2026-01-01T00:00:00Z")
+	mainMsg := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "shared thread", Body: "platypus report", Priority: "normal", SentAt: base, Trust: "verified", Status: "received",
+	}
+	if err := s.SaveMessage(ctx, mainMsg); err != nil {
+		t.Fatalf("SaveMessage(mainMsg): %v", err)
+	}
+	archiveMsg := &domain.Message{
+		ID: "m2", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "shared thread", Body: "platypus follow-up", Priority: "normal", SentAt: base.Add(time.Minute), Trust: "verified", Status: "received", Read: true,
+	}
+	insertArchiveMessage(t, s, archiveMsg)
+
+	got, err := s.SearchThreads(ctx, 1, "platypus", domain.ThreadFilter{})
+	if err != nil {
+		t.Fatalf("SearchThreads: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "t1" {
+		t.Fatalf("got %v, want exactly one t1 (must be deduplicated)", threadIDs(got))
+	}
+}
+
+func TestSearchThreadsAfterCursorAppliesToArchiveOnlyMatches(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	seedAgent(t, s, 1)
+
+	base := mustTime(t, "2026-01-01T00:00:00Z")
+
+	// A main thread that will serve as the after-cursor -- deliberately
+	// does not contain "wombat" itself, so it never appears in either
+	// side's query results and only serves as the cursor's reference row.
+	cursorThread := &domain.Message{
+		ID: "m1", ThreadID: "t1", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "cursor thread", Body: "unrelated content", Priority: "normal", SentAt: base, Trust: "verified", Status: "received",
+	}
+	if err := s.SaveMessage(ctx, cursorThread); err != nil {
+		t.Fatalf("SaveMessage(cursorThread): %v", err)
+	}
+
+	// An archive-only thread created before the cursor -- must be excluded.
+	before := &domain.Message{
+		ID: "m2", ThreadID: "t0", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "before cursor", Body: "wombat early notes", Priority: "normal", SentAt: base.Add(-time.Minute), Trust: "verified", Status: "received", Read: true,
+	}
+	seedFullyArchivedMessage(t, s, before)
+
+	// An archive-only thread created after the cursor -- must be included.
+	after := &domain.Message{
+		ID: "m3", ThreadID: "t2", AgentID: 1, Direction: "in", From: "a@x", To: "me@local", SenderDomain: "x",
+		Subject: "after cursor", Body: "wombat later notes", Priority: "normal", SentAt: base.Add(time.Minute), Trust: "verified", Status: "received", Read: true,
+	}
+	seedFullyArchivedMessage(t, s, after)
+
+	got, err := s.SearchThreads(ctx, 1, "wombat", domain.ThreadFilter{After: "t1"})
+	if err != nil {
+		t.Fatalf("SearchThreads: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "t2" {
+		t.Errorf("got %v, want only t2 (t0 excluded by after cursor)", threadIDs(got))
+	}
+}
+
 // seedAgent inserts a minimal agents row directly (no CreateAgent use case
 // exists yet — that's Phase 6) so messages.agent_id's foreign key is
 // satisfiable in these tests.

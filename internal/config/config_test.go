@@ -176,6 +176,43 @@ func TestLoad_RateLimitDefaultsWhenOmitted(t *testing.T) {
 	})
 }
 
+func TestLoad_ArchiveAfterDefaultsWhenUnset(t *testing.T) {
+	path := writeTempConfig(t, minimalYAMLNoAdminBindAddr) // also omits archive_after entirely
+	t.Setenv("CDAMPD_KEY_PASSPHRASE", "hunter2")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned unexpected error: %v", err)
+	}
+	if cfg.ArchiveAfter != defaultArchiveAfter {
+		t.Errorf("ArchiveAfter = %v, want default %v", cfg.ArchiveAfter, defaultArchiveAfter)
+	}
+}
+
+// explicitArchiveAfterYAML sets archive_after to a value other than the
+// default, to prove Load's new defaulting line never overrides an
+// operator's explicit setting.
+const explicitArchiveAfterYAML = `
+domain: agents.example.dev
+listen_addr: ":8443"
+sqlite_path: "./cdampd.db"
+signing_key_passphrase_env: "CDAMPD_KEY_PASSPHRASE"
+archive_after: 1h
+`
+
+func TestLoad_ArchiveAfterExplicitValueNotOverridden(t *testing.T) {
+	path := writeTempConfig(t, explicitArchiveAfterYAML)
+	t.Setenv("CDAMPD_KEY_PASSPHRASE", "hunter2")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned unexpected error: %v", err)
+	}
+	if cfg.ArchiveAfter != time.Hour {
+		t.Errorf("ArchiveAfter = %v, want %v (explicit value, no default override)", cfg.ArchiveAfter, time.Hour)
+	}
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	_, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
 	if err == nil {
