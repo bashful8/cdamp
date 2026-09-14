@@ -80,6 +80,8 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("initializing signer: %w", err)
 	}
 
+	rotator := signing.NewRotator(store, signer, cfg.SigningKeyPassphrase, cfg.KeyRotationGrace)
+
 	adminToken, created, err := app.BootstrapAdminCredential(context.Background(), store)
 	if err != nil {
 		return fmt.Errorf("bootstrapping admin credential: %w", err)
@@ -109,23 +111,26 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	server := newServer(mux, cfg, logger)
 
 	// The admin surface (POST/GET /admin/agents, POST/GET
-	// /admin/blocklist, /dashboard/) is served on its own,
-	// independently-bound http.Server — not a route group on the mux
-	// above — since 02-ARCHITECTURE.md's Auth table says it's "bound to
-	// localhost by default", only meaningful if it's reachable at a
-	// genuinely different address than cfg.ListenAddr (which may be
+	// /admin/blocklist, POST /admin/keys/rotate, /dashboard/) is served
+	// on its own, independently-bound http.Server — not a route group on
+	// the mux above — since 02-ARCHITECTURE.md's Auth table says it's
+	// "bound to localhost by default", only meaningful if it's reachable
+	// at a genuinely different address than cfg.ListenAddr (which may be
 	// 0.0.0.0-bound in production for federation traffic). store
 	// satisfies domain.InboxStore, domain.AdminStore, and
 	// domain.BlocklistStore simultaneously - the same *sqlite.Store
 	// value passed three times below, same "one concrete store, many
-	// narrow ports" pattern as above. dashboard is constructed
-	// separately (internal/adapters/web.NewDashboardHandler) and passed
-	// in as NewAdminMux's fourth argument so it can be mounted behind
-	// the same admin-session auth without internal/adapters/web
-	// importing internal/adapters/http (see STATUS.md's Phase 6 task 5
-	// spec "Design decisions").
+	// narrow ports" pattern as above. rotator is the concrete
+	// *signing.Rotator constructed above, passed in as a domain.KeyRotator
+	// so this package never imports internal/adapters/signing directly
+	// (see STATUS.md's Phase 8 task 3 spec, design decision 1). dashboard
+	// is constructed separately (internal/adapters/web.NewDashboardHandler)
+	// and passed in as NewAdminMux's dashboard argument so it can be
+	// mounted behind the same admin-session auth without
+	// internal/adapters/web importing internal/adapters/http (see
+	// STATUS.md's Phase 6 task 5 spec "Design decisions").
 	dashboard := web.NewDashboardHandler(store, cfg)
-	adminMux := httpadapter.NewAdminMux(store, store, store, dashboard, cfg)
+	adminMux := httpadapter.NewAdminMux(store, store, store, rotator, dashboard, cfg)
 	adminServer := &http.Server{
 		Addr:    cfg.AdminBindAddr,
 		Handler: loggingMiddleware(logger, adminMux),

@@ -53,8 +53,10 @@ func adminAuthMiddleware(store domain.AdminStore, next http.Handler) http.Handle
 
 // NewAdminMux returns the HTTP handler for CDAMP's admin API
 // (03-API.md's "Admin API" section): POST/GET /admin/agents, POST/GET
-// /admin/blocklist, and the human-facing dashboard mounted at
-// "/dashboard/". Every route requires the admin session cookie
+// /admin/blocklist, POST /admin/keys/rotate (Phase 8 task 3, not in
+// 03-API.md -- see STATUS.md's Phase 8 task 3 spec, design decision 6),
+// and the human-facing dashboard mounted at "/dashboard/". Every route
+// requires the admin session cookie
 // (adminAuthMiddleware) and the request body is capped at
 // app.MaxBodyBytes, same as every other mux in this package.
 //
@@ -72,12 +74,13 @@ func adminAuthMiddleware(store domain.AdminStore, next http.Handler) http.Handle
 // task's job too — see cmd/cdampd/main.go's "admin http server" wiring
 // for why a second listener, not a second route group on the existing
 // one, is required.
-func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, blocklist domain.BlocklistStore, dashboard http.Handler, cfg *config.Config) http.Handler {
+func NewAdminMux(inbox domain.InboxStore, admin domain.AdminStore, blocklist domain.BlocklistStore, rotator domain.KeyRotator, dashboard http.Handler, cfg *config.Config) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/agents", handleCreateAgentAdmin(inbox, cfg))
 	mux.HandleFunc("GET /admin/agents", handleListAgents(inbox, cfg))
 	mux.HandleFunc("POST /admin/blocklist", handleCreateBlocklistEntry(blocklist))
 	mux.HandleFunc("GET /admin/blocklist", handleListBlocklist(blocklist))
+	mux.HandleFunc("POST /admin/keys/rotate", handleRotateKey(rotator))
 	mux.Handle("/dashboard/", dashboard)
 
 	return sizeLimitMiddleware(adminAuthMiddleware(admin, mux))
@@ -228,6 +231,38 @@ func handleListBlocklist(bl domain.BlocklistStore) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"domains": items,
+		})
+	}
+}
+
+// rotateKeyResponse is the JSON shape of POST /admin/keys/rotate's 201
+// response. Not in 03-API.md (a genuinely new endpoint, no existing
+// shape to copy) -- see STATUS.md's Phase 8 task 3 spec, design
+// decision 6, for the reasoning: kid (the newly active key),
+// retired_kid (the key that just entered its grace period), and
+// retire_at (when it stops verifying inbound signatures at all, per
+// 01-PROTOCOL.md's 30-day window).
+type rotateKeyResponse struct {
+	KID        string    `json:"kid"`
+	RetiredKID string    `json:"retired_kid"`
+	RetireAt   time.Time `json:"retire_at"`
+}
+
+// handleRotateKey implements POST /admin/keys/rotate: no request body
+// (design decision 7) -> 201 {kid, retired_kid, retire_at}.
+func handleRotateKey(rotator domain.KeyRotator) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kid, retiredKID, retireAt, err := rotator.Rotate(r.Context())
+		if err != nil {
+			status, code := mapDomainError(err)
+			writeError(w, status, code, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, rotateKeyResponse{
+			KID:        kid,
+			RetiredKID: retiredKID,
+			RetireAt:   retireAt,
 		})
 	}
 }

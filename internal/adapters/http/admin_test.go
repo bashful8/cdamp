@@ -23,11 +23,12 @@ import (
 // adminCookie below authenticates against it).
 const adminPlaintext = "admin-bootstrap-secret"
 
-func newTestAdminMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.AdminStoreFake, *fakes.BlocklistStoreFake, *config.Config) {
+func newTestAdminMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.AdminStoreFake, *fakes.BlocklistStoreFake, *fakes.KeyRotatorFake, *config.Config) {
 	t.Helper()
 	inbox := fakes.NewInboxStoreFake()
 	admin := fakes.NewAdminStoreFake()
 	blocklist := fakes.NewBlocklistStoreFake()
+	rotator := fakes.NewKeyRotatorFake()
 	if err := admin.SaveAdminCredential(context.Background(), &domain.AdminCredential{
 		TokenHash: hashBearerToken(adminPlaintext),
 		CreatedAt: time.Now(),
@@ -39,7 +40,7 @@ func newTestAdminMux(t *testing.T) (http.Handler, *fakes.InboxStoreFake, *fakes.
 	// parameter here: none of this file's tests exercise /dashboard/*,
 	// which is covered by internal/adapters/web's own tests instead
 	// (see STATUS.md's Phase 6 task 5 spec).
-	return NewAdminMux(inbox, admin, blocklist, http.NewServeMux(), cfg), inbox, admin, blocklist, cfg
+	return NewAdminMux(inbox, admin, blocklist, rotator, http.NewServeMux(), cfg), inbox, admin, blocklist, rotator, cfg
 }
 
 // doAdminRequest issues a request against mux, attaching the admin cookie
@@ -68,7 +69,7 @@ func doAdminRequest(t *testing.T, mux http.Handler, method, target, cookieValue 
 // in this codebase (never calling hashBearerToken itself to check its own
 // output).
 func TestAdminMuxCreateAgentHappyPath(t *testing.T) {
-	mux, inbox, _, _, _ := newTestAdminMux(t)
+	mux, inbox, _, _, _, _ := newTestAdminMux(t)
 
 	body, _ := json.Marshal(map[string]string{"name": "alice"})
 	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/agents", adminPlaintext, body)
@@ -103,7 +104,7 @@ func TestAdminMuxCreateAgentHappyPath(t *testing.T) {
 }
 
 func TestAdminMuxCreateAgentDuplicateNameConflict(t *testing.T) {
-	mux, inbox, _, _, _ := newTestAdminMux(t)
+	mux, inbox, _, _, _, _ := newTestAdminMux(t)
 	inbox.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "existing-hash"})
 
 	body, _ := json.Marshal(map[string]string{"name": "alice"})
@@ -112,7 +113,7 @@ func TestAdminMuxCreateAgentDuplicateNameConflict(t *testing.T) {
 }
 
 func TestAdminMuxListAgents(t *testing.T) {
-	mux, inbox, _, _, _ := newTestAdminMux(t)
+	mux, inbox, _, _, _, _ := newTestAdminMux(t)
 	createdAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	inbox.AddAgent(&domain.Agent{ID: 1, Name: "alice", TokenHash: "hash-1", CreatedAt: createdAt})
 	inbox.AddAgent(&domain.Agent{ID: 2, Name: "bob", TokenHash: "hash-2", CreatedAt: createdAt})
@@ -152,7 +153,7 @@ func TestAdminMuxListAgents(t *testing.T) {
 }
 
 func TestAdminMuxListAgentsEmpty(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/agents", adminPlaintext, nil)
 	if rec.Code != http.StatusOK {
@@ -173,13 +174,13 @@ func TestAdminMuxListAgentsEmpty(t *testing.T) {
 }
 
 func TestAdminMuxMissingCookieRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/agents", "", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
 }
 
 func TestAdminMuxWrongCookieRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/agents", "not-the-right-value", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
 }
@@ -188,15 +189,16 @@ func TestAdminMuxNoCredentialBootstrappedRejected(t *testing.T) {
 	inbox := fakes.NewInboxStoreFake()
 	admin := fakes.NewAdminStoreFake() // no SaveAdminCredential call: GetAdminCredential returns ErrNotFound
 	blocklist := fakes.NewBlocklistStoreFake()
+	rotator := fakes.NewKeyRotatorFake()
 	cfg := &config.Config{Domain: "example.dev"}
-	mux := NewAdminMux(inbox, admin, blocklist, http.NewServeMux(), cfg)
+	mux := NewAdminMux(inbox, admin, blocklist, rotator, http.NewServeMux(), cfg)
 
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/agents", "anything", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
 }
 
 func TestAdminMuxCreateAgentOversizedBodyRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 
 	oversized := []byte(`{"name":"` + strings.Repeat("a", app.MaxBodyBytes+1) + `"}`)
 	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/agents", adminPlaintext, oversized)
@@ -204,7 +206,7 @@ func TestAdminMuxCreateAgentOversizedBodyRejected(t *testing.T) {
 }
 
 func TestAdminMuxCreateBlocklistEntryHappyPath(t *testing.T) {
-	mux, _, _, blocklist, _ := newTestAdminMux(t)
+	mux, _, _, blocklist, _, _ := newTestAdminMux(t)
 
 	body, _ := json.Marshal(map[string]string{"domain": "spam.example", "reason": "spam"})
 	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/blocklist", adminPlaintext, body)
@@ -243,7 +245,7 @@ func TestAdminMuxCreateBlocklistEntryHappyPath(t *testing.T) {
 }
 
 func TestAdminMuxCreateBlocklistEntryDuplicateDomainConflict(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 
 	body, _ := json.Marshal(map[string]string{"domain": "spam.example", "reason": "spam"})
 	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/blocklist", adminPlaintext, body)
@@ -256,7 +258,7 @@ func TestAdminMuxCreateBlocklistEntryDuplicateDomainConflict(t *testing.T) {
 }
 
 func TestAdminMuxListBlocklist(t *testing.T) {
-	mux, _, _, blocklist, _ := newTestAdminMux(t)
+	mux, _, _, blocklist, _, _ := newTestAdminMux(t)
 	addedAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	if err := blocklist.SaveBlocklistEntry(context.Background(), &domain.BlocklistEntry{
 		Domain: "a.example", Reason: "reason-a", AddedAt: addedAt,
@@ -307,7 +309,7 @@ func TestAdminMuxListBlocklist(t *testing.T) {
 }
 
 func TestAdminMuxListBlocklistEmpty(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/blocklist", adminPlaintext, nil)
 	if rec.Code != http.StatusOK {
@@ -328,21 +330,82 @@ func TestAdminMuxListBlocklistEmpty(t *testing.T) {
 }
 
 func TestAdminMuxBlocklistMissingCookieRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/blocklist", "", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
 }
 
 func TestAdminMuxBlocklistWrongCookieRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 	rec := doAdminRequest(t, mux, http.MethodGet, "/admin/blocklist", "not-the-right-value", nil)
 	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
 }
 
 func TestAdminMuxCreateBlocklistEntryOversizedBodyRejected(t *testing.T) {
-	mux, _, _, _, _ := newTestAdminMux(t)
+	mux, _, _, _, _, _ := newTestAdminMux(t)
 
 	oversized := []byte(`{"domain":"` + strings.Repeat("a", app.MaxBodyBytes+1) + `"}`)
 	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/blocklist", adminPlaintext, oversized)
 	assertErrorResponse(t, rec, http.StatusBadRequest, "body_too_large")
+}
+
+func TestAdminMuxRotateKeyHappyPath(t *testing.T) {
+	mux, _, _, _, rotator, _ := newTestAdminMux(t)
+	retireAt := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	rotator.SetRotateResult("k2", "k1", retireAt)
+
+	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/keys/rotate", adminPlaintext, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		KID        string    `json:"kid"`
+		RetiredKID string    `json:"retired_kid"`
+		RetireAt   time.Time `json:"retire_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if resp.KID != "k2" {
+		t.Errorf("kid = %q, want k2", resp.KID)
+	}
+	if resp.RetiredKID != "k1" {
+		t.Errorf("retired_kid = %q, want k1", resp.RetiredKID)
+	}
+	if !resp.RetireAt.Equal(retireAt) {
+		t.Errorf("retire_at = %v, want %v", resp.RetireAt, retireAt)
+	}
+
+	if got := rotator.Calls(); got != 1 {
+		t.Errorf("rotator.Calls() = %d, want 1 (handler must delegate to the port exactly once)", got)
+	}
+}
+
+func TestAdminMuxRotateKeyPropagatesRotatorError(t *testing.T) {
+	mux, _, _, _, rotator, _ := newTestAdminMux(t)
+	rotator.SetRotateError(domain.ErrNotFound)
+
+	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/keys/rotate", adminPlaintext, nil)
+	assertErrorResponse(t, rec, http.StatusNotFound, "not_found")
+}
+
+func TestAdminMuxRotateKeyMissingCookieRejected(t *testing.T) {
+	mux, _, _, _, rotator, _ := newTestAdminMux(t)
+	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/keys/rotate", "", nil)
+	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
+
+	if got := rotator.Calls(); got != 0 {
+		t.Errorf("rotator.Calls() = %d, want 0 (unauthorized request must never reach the port)", got)
+	}
+}
+
+func TestAdminMuxRotateKeyWrongCookieRejected(t *testing.T) {
+	mux, _, _, _, rotator, _ := newTestAdminMux(t)
+	rec := doAdminRequest(t, mux, http.MethodPost, "/admin/keys/rotate", "not-the-right-value", nil)
+	assertErrorResponse(t, rec, http.StatusUnauthorized, "unauthorized")
+
+	if got := rotator.Calls(); got != 0 {
+		t.Errorf("rotator.Calls() = %d, want 0 (unauthorized request must never reach the port)", got)
+	}
 }

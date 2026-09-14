@@ -112,6 +112,22 @@ type SigningKeyStore interface {
 	RetireSigningKey(ctx context.Context, kid string, retireAt time.Time) error
 }
 
+// KeyRotator performs a signing-key rotation end to end: generate a
+// fresh Ed25519 keypair, persist it as the new active key, retire the
+// previously-active key with a grace-period retire_at, and update the
+// live in-process signer so outbound signing switches to the new key
+// immediately (01-PROTOCOL.md's "no grace period on the sending side").
+// Implemented by internal/adapters/signing.Rotator. See STATUS.md's
+// Phase 8 task 3 spec, design decision 1, for why this is its own
+// narrow port rather than a method on SigningKeyStore/Signer, and for
+// why internal/adapters/http depends on this interface rather than
+// importing internal/adapters/signing directly.
+type KeyRotator interface {
+	// Rotate returns the newly active key's kid, the just-retired key's
+	// kid, and the retired key's retire_at.
+	Rotate(ctx context.Context) (newKID, retiredKID string, retireAt time.Time, err error)
+}
+
 // AdminStore persists the single bootstrap admin credential that
 // authenticates dashboard/admin-API sessions. Added additively per
 // STATUS.md's "Gap 2 decision — admin session auth (human-resolved,

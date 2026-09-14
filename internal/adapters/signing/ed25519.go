@@ -14,6 +14,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"cdamp/internal/domain"
@@ -34,6 +35,7 @@ const bootstrapKID = "k1"
 // that Sign (whose interface signature takes no context.Context and no
 // store parameter) never needs a store round-trip per call.
 type Ed25519Signer struct {
+	mu         sync.RWMutex
 	kid        string
 	privateKey ed25519.PrivateKey
 	publicKey  ed25519.PublicKey
@@ -80,13 +82,34 @@ func NewSigner(ctx context.Context, store domain.SigningKeyStore, passphrase str
 	}, nil
 }
 
-// Sign signs canonical with the signer's cached active key. No store call
-// happens here — all store access happened once, in NewSigner. stdlib
-// ed25519.Sign never returns an error, so this implementation's error
-// return is always nil; it exists only to satisfy domain.Signer's general
-// shape.
+// Sign signs canonical with the signer's currently-active cached key. No
+// store call happens here — all store access happened once, in NewSigner
+// (subsequent updates arrive via SetActiveKey, called by key rotation).
+// stdlib ed25519.Sign never returns an error, so this implementation's
+// error return is always nil; it exists only to satisfy domain.Signer's
+// general shape.
+//
+// Read-locked so a concurrent SetActiveKey (key rotation) can never be
+// observed mid-swap.
 func (s *Ed25519Signer) Sign(canonical []byte) (sig []byte, kid string, err error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return ed25519.Sign(s.privateKey, canonical), s.kid, nil
+}
+
+// SetActiveKey atomically replaces the signer's cached in-memory active
+// key. Called by Rotator.Rotate (rotation.go) the moment the new key is
+// persisted as active in the store -- without this, Sign would keep
+// using the retired key in memory until the daemon restarts,
+// contradicting 01-PROTOCOL.md's "all outbound signing switches to the
+// new key immediately at rotation." See STATUS.md's Phase 8 task 3 spec,
+// design decision 2, for why this gap existed and why this is the fix.
+func (s *Ed25519Signer) SetActiveKey(kid string, priv ed25519.PrivateKey, pub ed25519.PublicKey) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kid = kid
+	s.privateKey = priv
+	s.publicKey = pub
 }
 
 // Ed25519Verifier implements domain.Verifier. It is stateless: the public

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -206,4 +207,113 @@ func (e *erroringSigningKeyStore) GetPreviousSigningKey(ctx context.Context, pas
 
 func (e *erroringSigningKeyStore) RetireSigningKey(ctx context.Context, kid string, retireAt time.Time) error {
 	return e.err
+}
+
+func TestSignReflectsMostRecentSetActiveKey(t *testing.T) {
+	ctx := context.Background()
+	store := fakes.NewSigningKeyStoreFake()
+
+	signer, err := NewSigner(ctx, store, testPassphrase)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating second keypair: %v", err)
+	}
+	signer.SetActiveKey("k2", priv, pub)
+
+	canonical := []byte("researcher@example.dev|reviewer@other.dev|subject|normal||Zm9v==")
+	sig, kid, err := signer.Sign(canonical)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if kid != "k2" {
+		t.Errorf("Sign kid after SetActiveKey = %q, want k2", kid)
+	}
+
+	verifier := NewVerifier()
+	if !verifier.Verify(canonical, sig, pub) {
+		t.Errorf("Verify(sig, second key's public key) = false, want true")
+	}
+	if verifier.Verify(canonical, sig, signer.publicKey) && !signer.publicKey.Equal(pub) {
+		t.Errorf("signature unexpectedly verifies against a stale public key")
+	}
+}
+
+// TestSignAndSetActiveKeyConcurrentAccessDoesNotRace exercises Sign's
+// RLock and SetActiveKey's Lock concurrently -- run with `go test -race`,
+// the whole point of the mu sync.RWMutex added for key rotation (see
+// STATUS.md's Phase 8 task 3 spec, design decision 2). It doesn't assert
+// on Sign's output (which key wins a given call is inherently racy by
+// design), only that concurrent access is never observed as a data race
+// and every returned signature verifies against a key SetActiveKey
+// installed (never a torn kid/privateKey/publicKey combination).
+func TestSignAndSetActiveKeyConcurrentAccessDoesNotRace(t *testing.T) {
+	ctx := context.Background()
+	store := fakes.NewSigningKeyStoreFake()
+
+	signer, err := NewSigner(ctx, store, testPassphrase)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+
+	const rotations = 20
+	const signsPerRotation = 20
+
+	// keysByKID lets the verifying goroutine check each signature against
+	// the exact public key that was active under that kid, so a torn
+	// (kid, publicKey) pair would fail verification instead of merely
+	// going undetected.
+	var mu sync.Mutex
+	keysByKID := map[string]ed25519.PublicKey{signer.kid: signer.publicKey}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rotations; i++ {
+			pub, priv, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				t.Errorf("generating rotation keypair: %v", err)
+				return
+			}
+			kid := "rotated-key"
+			if i%2 == 1 {
+				kid = "rotated-key-alt"
+			}
+			mu.Lock()
+			keysByKID[kid] = pub
+			mu.Unlock()
+			signer.SetActiveKey(kid, priv, pub)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		verifier := NewVerifier()
+		canonical := []byte("researcher@example.dev|reviewer@other.dev|subject|normal||Zm9v==")
+		for i := 0; i < rotations*signsPerRotation; i++ {
+			sig, kid, err := signer.Sign(canonical)
+			if err != nil {
+				t.Errorf("Sign: %v", err)
+				return
+			}
+			mu.Lock()
+			pub, ok := keysByKID[kid]
+			mu.Unlock()
+			if !ok {
+				t.Errorf("Sign returned kid %q that was never installed via SetActiveKey", kid)
+				return
+			}
+			if !verifier.Verify(canonical, sig, pub) {
+				t.Errorf("Verify(sig, public key for kid %q) = false, want true (torn read of kid/private/public key)", kid)
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
 }
