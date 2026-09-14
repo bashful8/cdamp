@@ -571,3 +571,227 @@ func TestGetThreadTool_NotFoundBecomesToolError(t *testing.T) {
 		t.Fatalf("res.IsError = false, want true (content: %+v)", res.Content)
 	}
 }
+
+func TestListInboxTool_CallsCorrectEndpoint(t *testing.T) {
+	const token = "test-bearer-token"
+
+	var (
+		gotMethod string
+		gotPath   string
+		gotQuery  url.Values
+		gotAuth   string
+	)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query()
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]any{
+				{
+					"id":        "msg-1",
+					"thread_id": "thread-1",
+					"agent_id":  int64(42),
+					"direction": "inbound",
+					"from":      "alice@example.com",
+					"to":        "bob@example.com",
+					"subject":   "hello",
+					"body":      "hi there",
+					"priority":  "normal",
+					"sent_at":   "2026-09-13T00:00:00Z",
+					"trust":     "verified",
+					"status":    "delivered",
+				},
+				{
+					"id":        "msg-2",
+					"thread_id": "thread-1",
+					"agent_id":  int64(42),
+					"direction": "outbound",
+					"from":      "bob@example.com",
+					"to":        "alice@example.com",
+					"subject":   "re: hello",
+					"body":      "hi back",
+					"priority":  "normal",
+					"sent_at":   "2026-09-13T00:01:00Z",
+					"trust":     "verified",
+					"status":    "sent",
+				},
+			},
+			"next_cursor": "msg-2",
+		})
+	})
+
+	session := newTestSession(t, handler, token)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "list_inbox",
+		Arguments: map[string]any{
+			"query":       "hello",
+			"unread_only": true,
+			"from":        "a@x.test",
+			"thread":      "thread-1",
+			"status":      "delivered",
+			"limit":       10,
+			"cursor":      "msg-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if gotPath != "/messages" {
+		t.Errorf("path = %q, want /messages", gotPath)
+	}
+	if gotQuery.Get("q") != "hello" {
+		t.Errorf("query[q] = %q, want hello", gotQuery.Get("q"))
+	}
+	if gotQuery.Get("unread") != "true" {
+		t.Errorf("query[unread] = %q, want true", gotQuery.Get("unread"))
+	}
+	if gotQuery.Get("from") != "a@x.test" {
+		t.Errorf("query[from] = %q, want a@x.test", gotQuery.Get("from"))
+	}
+	if gotQuery.Get("thread") != "thread-1" {
+		t.Errorf("query[thread] = %q, want thread-1", gotQuery.Get("thread"))
+	}
+	if gotQuery.Get("status") != "delivered" {
+		t.Errorf("query[status] = %q, want delivered", gotQuery.Get("status"))
+	}
+	if gotQuery.Get("limit") != "10" {
+		t.Errorf("query[limit] = %q, want 10", gotQuery.Get("limit"))
+	}
+	if gotQuery.Get("after") != "msg-1" {
+		t.Errorf("query[after] = %q, want msg-1", gotQuery.Get("after"))
+	}
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+
+	messages, ok := structured["messages"].([]any)
+	if !ok {
+		t.Fatalf("StructuredContent[messages] is %T, want []any: %+v", structured["messages"], structured["messages"])
+	}
+	if len(messages) != 2 {
+		t.Fatalf("len(messages) = %d, want 2", len(messages))
+	}
+
+	first, ok := messages[0].(map[string]any)
+	if !ok {
+		t.Fatalf("messages[0] is %T, want map[string]any: %+v", messages[0], messages[0])
+	}
+	if first["id"] != "msg-1" {
+		t.Errorf("messages[0][id] = %v, want msg-1", first["id"])
+	}
+	if first["body"] != "hi there" {
+		t.Errorf("messages[0][body] = %v, want %q", first["body"], "hi there")
+	}
+
+	for i, m := range messages {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("messages[%d] is %T, want map[string]any: %+v", i, m, m)
+		}
+		if _, present := mm["agent_id"]; present {
+			t.Errorf("messages[%d] carries an agent_id key, want it dropped", i)
+		}
+	}
+
+	if structured["next_cursor"] != "msg-2" {
+		t.Errorf("StructuredContent[next_cursor] = %v, want msg-2", structured["next_cursor"])
+	}
+}
+
+func TestListInboxTool_OmittedOptionalFieldsAreNotSent(t *testing.T) {
+	var gotPath, gotRawQuery string
+	var gotQuery url.Values
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRawQuery = r.URL.RawQuery
+		gotQuery = r.URL.Query()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"messages":    []map[string]any{},
+			"next_cursor": nil,
+		})
+	})
+
+	session := newTestSession(t, handler, "test-bearer-token")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "list_inbox",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotPath != "/messages" {
+		t.Errorf("path = %q, want /messages", gotPath)
+	}
+	if gotRawQuery != "" {
+		t.Errorf("RawQuery = %q, want empty", gotRawQuery)
+	}
+	for _, key := range []string{"q", "unread", "from", "thread", "status", "limit", "after"} {
+		if gotQuery.Has(key) {
+			t.Errorf("query has %s = %q, want it absent entirely", key, gotQuery.Get(key))
+		}
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+
+	if structured["next_cursor"] != nil {
+		t.Errorf("StructuredContent[next_cursor] = %v, want nil", structured["next_cursor"])
+	}
+
+	messages, ok := structured["messages"].([]any)
+	if !ok {
+		t.Fatalf("StructuredContent[messages] is %T, want []any: %+v", structured["messages"], structured["messages"])
+	}
+	if len(messages) != 0 {
+		t.Errorf("len(messages) = %d, want 0", len(messages))
+	}
+
+	// Second call: unread_only explicitly false must encode identically
+	// to omission -- see the bool-semantics decision in this task's spec.
+	res2, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "list_inbox",
+		Arguments: map[string]any{
+			"unread_only": false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+	if gotQuery.Has("unread") {
+		t.Errorf("query has unread = %q, want it absent entirely for explicit unread_only:false", gotQuery.Get("unread"))
+	}
+	if res2.IsError {
+		t.Fatalf("res2.IsError = true, want false (content: %+v)", res2.Content)
+	}
+}

@@ -194,10 +194,84 @@ func newSearchThreadsHandler(c *Client) mcp.ToolHandlerFor[searchThreadsArgs, se
 	}
 }
 
+// listInboxArgs is list_inbox's input: 03-API.md's "MCP tool mapping"
+// table signature list_inbox(unread_only?, from?, thread?, status?,
+// limit?), plus two human-resolved optional additions: cursor (see
+// STATUS.md's "MCP pagination gap" decision, already applied by
+// search_threads) and query (see STATUS.md's "MCP list_inbox query gap"
+// decision). Every field is optional -- an all-omitted call is a
+// well-defined "give me my inbox, page one" request, per
+// handleListMessages. UnreadOnly is a plain bool, not *bool -- see this
+// task's spec in STATUS.md, "unread_only bool-semantics decision":
+// domain.MessageFilter.Unread is itself only ever a two-state bool
+// (there is no third domain state an omitted vs. explicit-false
+// argument would need to distinguish), so nothing is lost by not using
+// a pointer here.
+type listInboxArgs struct {
+	UnreadOnly bool   `json:"unread_only,omitempty" jsonschema:"true to return only unread messages; false or omitted returns all messages regardless of read state"`
+	From       string `json:"from,omitempty" jsonschema:"optional sender address filter"`
+	Thread     string `json:"thread,omitempty" jsonschema:"optional thread id filter"`
+	Status     string `json:"status,omitempty" jsonschema:"optional delivery status filter"`
+	Limit      int    `json:"limit,omitempty" jsonschema:"optional page size, default 50, max 200 (enforced server-side)"`
+	Cursor     string `json:"cursor,omitempty" jsonschema:"optional page cursor from a previous call's next_cursor, to fetch the next page"`
+	Query      string `json:"query,omitempty" jsonschema:"optional free-text match against message bodies (FTS5); omitted returns all matching messages regardless of content"`
+}
+
+// listInboxOut is list_inbox's output: GET /messages's 200 response body
+// (03-API.md: {messages: [...], next_cursor}). Messages reuses
+// readMessageOut verbatim, same reasoning as getThreadOut -- see this
+// task's spec in STATUS.md, design decision 4. NextCursor has no
+// ",omitempty" -- the wire always carries the key.
+type listInboxOut struct {
+	Messages   []readMessageOut `json:"messages"`
+	NextCursor *string          `json:"next_cursor"`
+}
+
+// newListInboxHandler returns the tool handler for list_inbox, closing
+// over c. Each of the seven possible query params is added only when it
+// carries a non-default value -- see this task's spec in STATUS.md,
+// design decision 5, for UnreadOnly's true-only encoding in particular.
+// On any Client error it returns the error unchanged, same passthrough
+// pattern as every other handler here.
+func newListInboxHandler(c *Client) mcp.ToolHandlerFor[listInboxArgs, listInboxOut] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args listInboxArgs) (*mcp.CallToolResult, listInboxOut, error) {
+		var out listInboxOut
+		q := url.Values{}
+		if args.Query != "" {
+			q.Set("q", args.Query)
+		}
+		if args.UnreadOnly {
+			q.Set("unread", "true")
+		}
+		if args.From != "" {
+			q.Set("from", args.From)
+		}
+		if args.Thread != "" {
+			q.Set("thread", args.Thread)
+		}
+		if args.Status != "" {
+			q.Set("status", args.Status)
+		}
+		if args.Limit > 0 {
+			q.Set("limit", strconv.Itoa(args.Limit))
+		}
+		if args.Cursor != "" {
+			q.Set("after", args.Cursor)
+		}
+		path := "/messages"
+		if encoded := q.Encode(); encoded != "" {
+			path += "?" + encoded
+		}
+		if err := c.doJSON(ctx, "GET", path, nil, &out); err != nil {
+			return nil, listInboxOut{}, err
+		}
+		return nil, out, nil
+	}
+}
+
 // NewServer builds the cdampd MCP server and registers send_mail,
-// read_message, get_thread, and search_threads. The remaining tool
-// (list_inbox) is explicitly out of scope for this task -- see
-// STATUS.md's "Explicitly out of scope for this task".
+// read_message, get_thread, search_threads, and list_inbox -- all five
+// Phase 7 tools.
 func NewServer(c *Client) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "cdampd", Version: "0.1.0"}, nil)
 	mcp.AddTool(server, &mcp.Tool{
@@ -216,6 +290,10 @@ func NewServer(c *Client) *mcp.Server {
 		Name:        "search_threads",
 		Description: "Search the caller's threads by free-text query; empty query returns all of the caller's threads, oldest first.",
 	}, newSearchThreadsHandler(c))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "list_inbox",
+		Description: "List the caller's own inbox messages, optionally filtered by query/unread/from/thread/status, oldest-page-first.",
+	}, newListInboxHandler(c))
 	return server
 }
 
