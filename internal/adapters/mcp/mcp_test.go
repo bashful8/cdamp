@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -375,6 +376,170 @@ func TestGetThreadTool_CallsCorrectEndpoint(t *testing.T) {
 		if _, present := mm["agent_id"]; present {
 			t.Errorf("messages[%d] carries an agent_id key, want it dropped", i)
 		}
+	}
+}
+
+func TestSearchThreadsTool_CallsCorrectEndpoint(t *testing.T) {
+	const token = "test-bearer-token"
+
+	var (
+		gotMethod string
+		gotPath   string
+		gotQuery  url.Values
+		gotAuth   string
+	)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotQuery = r.URL.Query()
+		gotAuth = r.Header.Get("Authorization")
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"threads": []map[string]any{
+				{
+					"id":            "thread-1",
+					"subject":       "hello",
+					"created_at":    "2026-09-13T00:00:00Z",
+					"message_count": 3,
+				},
+				{
+					"id":            "thread-2",
+					"subject":       "another",
+					"created_at":    "2026-09-13T00:01:00Z",
+					"message_count": 1,
+				},
+			},
+			"next_cursor": "thread-2",
+		})
+	})
+
+	session := newTestSession(t, handler, token)
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "search_threads",
+		Arguments: map[string]any{
+			"query":  "hello",
+			"limit":  10,
+			"cursor": "thread-1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
+	if gotPath != "/threads" {
+		t.Errorf("path = %q, want /threads", gotPath)
+	}
+	if gotQuery.Get("q") != "hello" {
+		t.Errorf("query[q] = %q, want hello", gotQuery.Get("q"))
+	}
+	if gotQuery.Get("limit") != "10" {
+		t.Errorf("query[limit] = %q, want 10", gotQuery.Get("limit"))
+	}
+	if gotQuery.Get("after") != "thread-1" {
+		t.Errorf("query[after] = %q, want thread-1", gotQuery.Get("after"))
+	}
+	if gotAuth != "Bearer "+token {
+		t.Errorf("Authorization = %q, want %q", gotAuth, "Bearer "+token)
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+
+	threads, ok := structured["threads"].([]any)
+	if !ok {
+		t.Fatalf("StructuredContent[threads] is %T, want []any: %+v", structured["threads"], structured["threads"])
+	}
+	if len(threads) != 2 {
+		t.Fatalf("len(threads) = %d, want 2", len(threads))
+	}
+
+	first, ok := threads[0].(map[string]any)
+	if !ok {
+		t.Fatalf("threads[0] is %T, want map[string]any: %+v", threads[0], threads[0])
+	}
+	if first["id"] != "thread-1" {
+		t.Errorf("threads[0][id] = %v, want thread-1", first["id"])
+	}
+	if first["subject"] != "hello" {
+		t.Errorf("threads[0][subject] = %v, want hello", first["subject"])
+	}
+	if first["message_count"] != float64(3) {
+		t.Errorf("threads[0][message_count] = %v, want 3", first["message_count"])
+	}
+
+	if structured["next_cursor"] != "thread-2" {
+		t.Errorf("StructuredContent[next_cursor] = %v, want thread-2", structured["next_cursor"])
+	}
+}
+
+func TestSearchThreadsTool_OmittedOptionalFieldsAreNotSent(t *testing.T) {
+	var gotQuery url.Values
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]any{
+			"threads":     []map[string]any{},
+			"next_cursor": nil,
+		})
+	})
+
+	session := newTestSession(t, handler, "test-bearer-token")
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "search_threads",
+		Arguments: map[string]any{
+			"query": "hello",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool returned an error: %v", err)
+	}
+
+	if gotQuery.Has("limit") {
+		t.Errorf("query has limit = %q, want it absent entirely", gotQuery.Get("limit"))
+	}
+	if gotQuery.Has("after") {
+		t.Errorf("query has after = %q, want it absent entirely", gotQuery.Get("after"))
+	}
+	if gotQuery.Get("q") != "hello" {
+		t.Errorf("query[q] = %q, want hello", gotQuery.Get("q"))
+	}
+
+	if res.IsError {
+		t.Fatalf("res.IsError = true, want false (content: %+v)", res.Content)
+	}
+
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent is %T, want map[string]any: %+v", res.StructuredContent, res.StructuredContent)
+	}
+
+	if structured["next_cursor"] != nil {
+		t.Errorf("StructuredContent[next_cursor] = %v, want nil", structured["next_cursor"])
+	}
+
+	threads, ok := structured["threads"].([]any)
+	if !ok {
+		t.Fatalf("StructuredContent[threads] is %T, want []any: %+v", structured["threads"], structured["threads"])
+	}
+	if len(threads) != 0 {
+		t.Errorf("len(threads) = %d, want 0", len(threads))
 	}
 }
 

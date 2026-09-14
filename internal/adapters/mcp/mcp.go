@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"net/url"
+	"strconv"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -134,9 +135,68 @@ func newGetThreadHandler(c *Client) mcp.ToolHandlerFor[getThreadArgs, getThreadO
 	}
 }
 
+// searchThreadsArgs is search_threads's input: 03-API.md's "MCP tool
+// mapping" table signature search_threads(query, limit?), plus a
+// human-resolved optional cursor field for page 2+ (see STATUS.md's
+// "MCP pagination gap" decision). See this task's spec in STATUS.md,
+// design decisions 2, 3, and 6 -- an empty Query is a well-defined "all
+// of the caller's threads" REST call, not an error, and cursor maps
+// directly to REST's existing after query param.
+type searchThreadsArgs struct {
+	Query  string `json:"query" jsonschema:"the search query -- matches any message in a thread (FTS5); empty returns all of the caller's threads"`
+	Limit  int    `json:"limit,omitempty" jsonschema:"optional page size, default 50, max 200 (enforced server-side)"`
+	Cursor string `json:"cursor,omitempty" jsonschema:"optional page cursor from a previous call's next_cursor, to fetch the next page"`
+}
+
+// threadSummary is the JSON shape of one entry in GET /threads' "threads"
+// array, mirroring internal/adapters/http/local.go's threadListItem
+// field-for-field -- see this task's spec in STATUS.md, design decision
+// 4. created_at is a plain string, not time.Time, same reasoning as
+// threadInfo/readMessageOut.
+type threadSummary struct {
+	ID           string `json:"id"`
+	Subject      string `json:"subject"`
+	CreatedAt    string `json:"created_at"`
+	MessageCount int    `json:"message_count"`
+}
+
+// searchThreadsOut is search_threads's output: GET /threads?q=...'s 200
+// response body (03-API.md: {threads: [...], next_cursor}). NextCursor
+// has no ",omitempty" -- the wire always carries the key, as a string or
+// JSON null -- see this task's spec in STATUS.md, design decision 5.
+type searchThreadsOut struct {
+	Threads    []threadSummary `json:"threads"`
+	NextCursor *string         `json:"next_cursor"`
+}
+
+// newSearchThreadsHandler returns the tool handler for search_threads,
+// closing over c. The query string is built with net/url.Values (not
+// path escaping -- args.Query is free text, unlike task 2/3's
+// path-segment ids) so args.Query and, if positive, args.Limit are
+// correctly form-encoded. On any Client error it returns the error
+// unchanged, same passthrough pattern as every other handler here.
+func newSearchThreadsHandler(c *Client) mcp.ToolHandlerFor[searchThreadsArgs, searchThreadsOut] {
+	return func(ctx context.Context, req *mcp.CallToolRequest, args searchThreadsArgs) (*mcp.CallToolResult, searchThreadsOut, error) {
+		var out searchThreadsOut
+		q := url.Values{}
+		q.Set("q", args.Query)
+		if args.Limit > 0 {
+			q.Set("limit", strconv.Itoa(args.Limit))
+		}
+		if args.Cursor != "" {
+			q.Set("after", args.Cursor)
+		}
+		path := "/threads?" + q.Encode()
+		if err := c.doJSON(ctx, "GET", path, nil, &out); err != nil {
+			return nil, searchThreadsOut{}, err
+		}
+		return nil, out, nil
+	}
+}
+
 // NewServer builds the cdampd MCP server and registers send_mail,
-// read_message, and get_thread. The remaining two tools (list_inbox,
-// search_threads) are explicitly out of scope for this task -- see
+// read_message, get_thread, and search_threads. The remaining tool
+// (list_inbox) is explicitly out of scope for this task -- see
 // STATUS.md's "Explicitly out of scope for this task".
 func NewServer(c *Client) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "cdampd", Version: "0.1.0"}, nil)
@@ -152,6 +212,10 @@ func NewServer(c *Client) *mcp.Server {
 		Name:        "get_thread",
 		Description: "Fetch a thread's full ordered message list by thread id.",
 	}, newGetThreadHandler(c))
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search_threads",
+		Description: "Search the caller's threads by free-text query; empty query returns all of the caller's threads, oldest first.",
+	}, newSearchThreadsHandler(c))
 	return server
 }
 
