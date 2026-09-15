@@ -46,6 +46,21 @@ type cacheEntry struct {
 	fetchedAt time.Time
 }
 
+// previousCacheEntry is one domain's cached previous (grace-period) key
+// resolution, plus fetch time -- deliberately keyed by domain name alone,
+// not by full address like cacheEntry: GET /.well-known/cdamp/keys
+// (ResolvePrevious's underlying endpoint) is a whole-domain response with
+// no per-agent segment, unlike GET /.well-known/cdamp/{agent} (Resolve's
+// own endpoint), so every agent address at the same domain shares one
+// entry here rather than one each -- see STATUS.md's Phase 8 task 5 spec,
+// design decision 4, for the full reasoning behind this being a separate,
+// differently-keyed cache rather than folded into cacheEntry/entries.
+type previousCacheEntry struct {
+	pubkey    ed25519.PublicKey
+	kid       string
+	fetchedAt time.Time
+}
+
 // HTTPDirectory implements domain.Directory via HTTP well-known lookups
 // against a remote instance's /.well-known/cdamp/{agent} endpoint, with an
 // in-memory TTL cache so a delivery doesn't do a discovery round-trip per
@@ -56,6 +71,13 @@ type HTTPDirectory struct {
 
 	mu      sync.Mutex
 	entries map[string]cacheEntry
+
+	// previousEntries is ResolvePrevious's own cache, keyed by domain name
+	// -- see previousCacheEntry's doc comment. Guarded by the same mu as
+	// entries: this adapter has no contention profile that would benefit
+	// from a second lock, and every existing lock/unlock pair here already
+	// assumes exclusive access to the whole struct.
+	previousEntries map[string]previousCacheEntry
 
 	// now is an injectable time source, overridable only from this
 	// package's own tests, so TTL expiry can be exercised without a real
@@ -74,10 +96,11 @@ func NewHTTPDirectory(client *http.Client, ttl time.Duration) *HTTPDirectory {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
 	return &HTTPDirectory{
-		client:  client,
-		ttl:     ttl,
-		entries: map[string]cacheEntry{},
-		now:     time.Now,
+		client:          client,
+		ttl:             ttl,
+		entries:         map[string]cacheEntry{},
+		previousEntries: map[string]previousCacheEntry{},
+		now:             time.Now,
 	}
 }
 
@@ -150,6 +173,136 @@ func (d *HTTPDirectory) store(address string, pubkey ed25519.PublicKey, kid, inb
 		inboxURL:  inboxURL,
 		fetchedAt: d.now(),
 	}
+}
+
+// ResolvePrevious implements domain.Directory. It splits address to find
+// the sender's domain (the agent-name part is discarded -- see
+// previousCacheEntry's doc comment for why this cache and its underlying
+// endpoint are both domain-scoped, not per-agent), checks the previous-key
+// TTL cache, and otherwise performs a single GET
+// https://<domain>/.well-known/cdamp/keys request, returning its
+// "previous" field.
+//
+// Error handling mirrors Resolve's own contract (see Resolve's doc
+// comment): a wrapped domain.ErrNotFound means "nothing to fall back to"
+// -- either the domain has no previous key at all, or one exists but its
+// grace period has already elapsed; handleWellKnownKeys
+// (internal/adapters/http/federation.go) already applies that filter
+// server-side and omits "previous" from its response identically in both
+// cases, so this method cannot and does not distinguish them either. Any
+// other failure (network error, malformed body, non-2xx status) returns a
+// plain wrapped error, never domain.ErrNotFound.
+func (d *HTTPDirectory) ResolvePrevious(ctx context.Context, address string) (ed25519.PublicKey, string, error) {
+	_, domainName, err := splitAddress(address)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve previous %q: %w", address, err)
+	}
+
+	if entry, ok := d.cachedPrevious(domainName); ok {
+		return entry.pubkey, entry.kid, nil
+	}
+
+	pubkey, kid, err := d.fetchPrevious(ctx, domainName)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve previous %q: %w", address, err)
+	}
+
+	d.storePrevious(domainName, pubkey, kid)
+	return pubkey, kid, nil
+}
+
+// cachedPrevious returns the cached previous-key entry for domainName, if
+// present and not expired per d.ttl and d.now -- mirrors cached exactly,
+// against the separate previousEntries map.
+func (d *HTTPDirectory) cachedPrevious(domainName string) (previousCacheEntry, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	entry, ok := d.previousEntries[domainName]
+	if !ok {
+		return previousCacheEntry{}, false
+	}
+	if d.now().Sub(entry.fetchedAt) >= d.ttl {
+		return previousCacheEntry{}, false
+	}
+	return entry, true
+}
+
+// storePrevious records a successful previous-key resolution for
+// domainName -- mirrors store exactly, against the separate
+// previousEntries map.
+func (d *HTTPDirectory) storePrevious(domainName string, pubkey ed25519.PublicKey, kid string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.previousEntries[domainName] = previousCacheEntry{
+		pubkey:    pubkey,
+		kid:       kid,
+		fetchedAt: d.now(),
+	}
+}
+
+// wellKnownKeyClientEntry is one {kid, pubkey} entry read from GET
+// /.well-known/cdamp/keys' response, from the requesting side. Mirrors
+// 03-API.md's shape and the server-side wellKnownKeyEntry federation.go
+// already defines -- duplicated here rather than imported, per this
+// package's own established pattern (adapters never import each other's
+// response types; wellKnownResponse above is this same file's existing
+// precedent for the per-agent endpoint). PubKey is a plain base64 string
+// decoded manually in fetchPrevious, mirroring wellKnownResponse
+// .PublicKey's own manual-decode style exactly -- not the
+// []byte-auto-decode style federation.go's server-side types use --
+// kept consistent with this file's own existing convention rather than
+// the server's.
+type wellKnownKeyClientEntry struct {
+	KID    string `json:"kid"`
+	PubKey string `json:"pubkey"`
+}
+
+// wellKnownKeysClientResponse is GET /.well-known/cdamp/keys' response
+// shape, from the requesting side. "current" is deliberately not declared
+// as a field at all -- ResolvePrevious never needs it, and encoding/json
+// silently ignores a JSON object key with no matching struct field, so
+// omitting it entirely is simpler than declaring and then ignoring it.
+type wellKnownKeysClientResponse struct {
+	Previous *wellKnownKeyClientEntry `json:"previous,omitempty"`
+}
+
+// fetchPrevious performs the single HTTP well-known-keys lookup and parses
+// its "previous" field. Like fetch, it never caches on the caller's
+// behalf -- ResolvePrevious does that, and only for the success path.
+func (d *HTTPDirectory) fetchPrevious(ctx context.Context, domainName string) (ed25519.PublicKey, string, error) {
+	reqURL := fmt.Sprintf("https://%s/.well-known/cdamp/keys", domainName)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("building request: %w", err)
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("performing request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	var body wellKnownKeysClientResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, "", fmt.Errorf("decoding response body: %w", err)
+	}
+
+	if body.Previous == nil {
+		return nil, "", fmt.Errorf("%w", domain.ErrNotFound)
+	}
+
+	rawKey, err := base64.StdEncoding.DecodeString(body.Previous.PubKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("decoding previous.pubkey: %w", err)
+	}
+
+	return ed25519.PublicKey(rawKey), body.Previous.KID, nil
 }
 
 // fetch performs the single HTTP well-known lookup and parses its

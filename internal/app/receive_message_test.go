@@ -18,7 +18,8 @@ import (
 // trust case (per the testing list's explicit ask).
 type countingDirectory struct {
 	*fakes.DirectoryFake
-	calls int
+	calls         int
+	previousCalls int
 }
 
 func newCountingDirectory() *countingDirectory {
@@ -28,6 +29,11 @@ func newCountingDirectory() *countingDirectory {
 func (d *countingDirectory) Resolve(ctx context.Context, address string) (ed25519.PublicKey, string, string, error) {
 	d.calls++
 	return d.DirectoryFake.Resolve(ctx, address)
+}
+
+func (d *countingDirectory) ResolvePrevious(ctx context.Context, address string) (ed25519.PublicKey, string, error) {
+	d.previousCalls++
+	return d.DirectoryFake.ResolvePrevious(ctx, address)
 }
 
 // countingStore wraps fakes.InboxStoreFake to count SaveMessage calls.
@@ -183,6 +189,136 @@ func TestReceiveMessageTrustUntrustedResolveFails(t *testing.T) {
 	res, err := ReceiveMessage(context.Background(), store, directory, verifier, req)
 	if err != nil {
 		t.Fatalf("expected no hard error when directory resolve fails, got: %v", err)
+	}
+	if res.Trust != "untrusted" {
+		t.Fatalf("Trust = %q, want untrusted", res.Trust)
+	}
+}
+
+func TestReceiveMessageTrustVerifiedViaPreviousKey(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	seedRecipient(store)
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+
+	// Current key: some unrelated keypair the sender has already rotated
+	// away from signing with (simulates 01-PROTOCOL.md's post-rotation
+	// state: Resolve now returns the *new* active key, not the one that
+	// actually signed this message).
+	currentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating current keypair: %v", err)
+	}
+	directory.Add("researcher@example.dev", currentPub, "k2", "https://example.dev/deliver")
+
+	// Previous (grace-period) key: what actually signed the message.
+	prevPub, prevPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating previous keypair: %v", err)
+	}
+	directory.AddPrevious("researcher@example.dev", prevPub, "k1")
+
+	req := signRequest(t, baseReceiveMessageRequest(), prevPriv, "k1")
+
+	res, err := ReceiveMessage(context.Background(), store, directory, verifier, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Trust != "verified" {
+		t.Fatalf("Trust = %q, want verified (signed with the sender's previous, still-in-grace key)", res.Trust)
+	}
+}
+
+func TestReceiveMessageTrustCurrentKeySucceedsWithoutConsultingPreviousKey(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	seedRecipient(store)
+	directory := newCountingDirectory()
+	verifier := fakes.NewVerifierFake()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating keypair: %v", err)
+	}
+	directory.Add("researcher@example.dev", pub, "k1", "https://example.dev/deliver")
+
+	req := signRequest(t, baseReceiveMessageRequest(), priv, "k1")
+
+	res, err := ReceiveMessage(context.Background(), store, directory, verifier, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Trust != "verified" {
+		t.Fatalf("Trust = %q, want verified", res.Trust)
+	}
+	if directory.previousCalls != 0 {
+		t.Fatalf("ResolvePrevious called %d times, want 0 (current-key verification already succeeded)", directory.previousCalls)
+	}
+}
+
+func TestReceiveMessageTrustUntrustedWhenNeitherCurrentNorPreviousKeyMatches(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	seedRecipient(store)
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+
+	currentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating current keypair: %v", err)
+	}
+	directory.Add("researcher@example.dev", currentPub, "k2", "https://example.dev/deliver")
+
+	prevPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating previous keypair: %v", err)
+	}
+	directory.AddPrevious("researcher@example.dev", prevPub, "k1")
+
+	// Signed with neither of the two registered keys.
+	_, unknownPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating unknown keypair: %v", err)
+	}
+	req := signRequest(t, baseReceiveMessageRequest(), unknownPriv, "k1")
+
+	res, err := ReceiveMessage(context.Background(), store, directory, verifier, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.Trust != "untrusted" {
+		t.Fatalf("Trust = %q, want untrusted", res.Trust)
+	}
+}
+
+// TestReceiveMessageTrustUntrustedNoPreviousKeyRegistered mirrors an
+// expired/absent previous key at the fake layer: no AddPrevious call at
+// all, so ResolvePrevious reports ErrNotFound -- per
+// domain.Directory.ResolvePrevious's own doc comment, indistinguishable
+// from "grace period elapsed," exactly the outcome 04-BUILD-PLAN.md's
+// scenario 5 names. The genuinely end-to-end version of this (a real
+// elapsed grace period against a real HTTPDirectory) is
+// cmd/cdampd/integration_test.go's
+// TestIntegrationScenario5_ExpiredPreviousKeyUntrusted.
+func TestReceiveMessageTrustUntrustedNoPreviousKeyRegistered(t *testing.T) {
+	store := fakes.NewInboxStoreFake()
+	seedRecipient(store)
+	directory := fakes.NewDirectoryFake()
+	verifier := fakes.NewVerifierFake()
+
+	currentPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating current keypair: %v", err)
+	}
+	directory.Add("researcher@example.dev", currentPub, "k2", "https://example.dev/deliver")
+
+	_, unknownPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating unknown keypair: %v", err)
+	}
+	req := signRequest(t, baseReceiveMessageRequest(), unknownPriv, "k1")
+
+	res, err := ReceiveMessage(context.Background(), store, directory, verifier, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.Trust != "untrusted" {
 		t.Fatalf("Trust = %q, want untrusted", res.Trust)

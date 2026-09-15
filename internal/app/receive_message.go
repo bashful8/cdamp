@@ -161,30 +161,33 @@ func ReceiveMessage(
 	return &ReceiveMessageResult{ID: m.ID, Duplicate: false, Trust: m.Trust}, nil
 }
 
-// assignTrust implements 01-PROTOCOL.md's three-row trust-level table.
+// assignTrust implements 01-PROTOCOL.md's three-row trust-level table,
+// including its grace-period row: "verified | Signature checks out |
+// Verify() succeeds against the sender domain's current OR previous
+// (grace-period) key" (01-PROTOCOL.md line 123).
 //
 //   - No signature/kid at all -> "external". Directory.Resolve is
 //     deliberately never called in this branch: there's nothing to verify
 //     against, so skipping it avoids a wasted network round-trip for every
 //     unsigned message.
-//   - Signature+kid present, but the sender domain's discovery lookup
-//     fails, the signature fails to base64-decode, or Verify reports false
-//     -> "untrusted". None of these is treated as a hard error that aborts
-//     the request — the message is still stored and tagged, per
-//     01-PROTOCOL.md's "why store untrusted mail" rationale.
-//   - Signature+kid present and Verify reports true -> "verified".
-//
-// Key-rotation grace-period fallback to a sender's previous key is
-// explicitly out of scope: domain.Directory.Resolve only ever returns one
-// pubkey today (Phase 8 territory).
+//   - Signature+kid present: Verify is tried first against the sender
+//     domain's current key (Directory.Resolve). If that fails for any
+//     reason -- Resolve itself erroring (domain/agent unreachable or
+//     unknown), or Verify reporting false -- it is tried a second time
+//     against the domain's previous, grace-period key
+//     (Directory.ResolvePrevious), added in Phase 8 task 5 specifically
+//     for this fallback. ResolvePrevious is only ever called after the
+//     current-key attempt has already failed, never in its place or in
+//     parallel with it, so a message signed with the still-active current
+//     key never pays for a second HTTP round-trip.
+//   - Either attempt succeeding -> "verified". Both failing -> "untrusted".
+//     Neither a Resolve/ResolvePrevious error nor a failed Verify is
+//     treated as a hard error that aborts the request -- the message is
+//     still stored and tagged, per 01-PROTOCOL.md's "why store untrusted
+//     mail" rationale.
 func assignTrust(ctx context.Context, directory domain.Directory, verifier domain.Verifier, req ReceiveMessageRequest) string {
 	if req.Signature == "" && req.KID == "" {
 		return "external"
-	}
-
-	pubkey, _, _, err := directory.Resolve(ctx, req.From)
-	if err != nil {
-		return "untrusted"
 	}
 
 	payload := map[string]any{
@@ -202,9 +205,14 @@ func assignTrust(ctx context.Context, directory domain.Directory, verifier domai
 		return "untrusted"
 	}
 
-	if verifier.Verify(canonical, sig, pubkey) {
+	if pubkey, _, _, err := directory.Resolve(ctx, req.From); err == nil && verifier.Verify(canonical, sig, pubkey) {
 		return "verified"
 	}
+
+	if pubkey, _, err := directory.ResolvePrevious(ctx, req.From); err == nil && verifier.Verify(canonical, sig, pubkey) {
+		return "verified"
+	}
+
 	return "untrusted"
 }
 

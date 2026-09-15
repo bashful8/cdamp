@@ -24,6 +24,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,6 +45,7 @@ import (
 	"cdamp/internal/adapters/directory"
 	"cdamp/internal/adapters/signing"
 	"cdamp/internal/adapters/storage/sqlite"
+	"cdamp/internal/app"
 	"cdamp/internal/config"
 	"cdamp/internal/domain"
 
@@ -212,7 +215,13 @@ func (t *loopbackRewriteTransport) RoundTrip(req *http.Request) (*http.Response,
 // port when cfg.ListenAddr is "127.0.0.1:0" — this test needs each
 // instance's real port *before* it can build the other instance's
 // redirect table.
-func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTPClient *http.Client) (addr string, store *sqlite.Store) {
+//
+// Also returns the real *signing.Ed25519Signer this instance's
+// delivery.Client was constructed with -- Phase 8 task 5's grace-period
+// scenarios need to sign directly against it and later rotate it via a
+// real admin-mux call, so the exact same live signer instance must be
+// reachable from outside this function, not silently discarded as before.
+func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTPClient *http.Client) (addr string, store *sqlite.Store, signer *signing.Ed25519Signer) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -228,7 +237,7 @@ func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTP
 	// context.Background(), not a cancelable context: this is one-time
 	// startup work, mirroring run()'s own use of context.Background() for
 	// signer bootstrap.
-	signer, err := signing.NewSigner(context.Background(), store, cfg.SigningKeyPassphrase)
+	signer, err = signing.NewSigner(context.Background(), store, cfg.SigningKeyPassphrase)
 	if err != nil {
 		t.Fatalf("initializing signer for %s: %v", cfg.Domain, err)
 	}
@@ -262,7 +271,7 @@ func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTP
 		_ = store.Close()
 	})
 
-	return listener.Addr().String(), store
+	return listener.Addr().String(), store, signer
 }
 
 // setupFederationPair builds two full, independently-keyed cdampd
@@ -281,7 +290,7 @@ func startTestInstance(t *testing.T, cfg *config.Config, dirClient, deliveryHTTP
 //
 // aOnRequest, if non-nil, becomes A's delivery-side transport's request
 // hook (Scenario 2 uses this to force the first POST /deliver to fail).
-func setupFederationPair(t *testing.T, aRetrySchedule []time.Duration, aOnRequest onRequestFunc, senderToken string) (aAddr, bAddr string, aStore, bStore *sqlite.Store, aTransport *loopbackRewriteTransport) {
+func setupFederationPair(t *testing.T, aRetrySchedule []time.Duration, aOnRequest onRequestFunc, senderToken string) (aAddr, bAddr string, aStore, bStore *sqlite.Store, aTransport *loopbackRewriteTransport, aSigner *signing.Ed25519Signer) {
 	t.Helper()
 
 	aTransport = newLoopbackRewriteTransport(aOnRequest)
@@ -313,8 +322,8 @@ func setupFederationPair(t *testing.T, aRetrySchedule []time.Duration, aOnReques
 	// Each instance's Directory and delivery.Client share the same
 	// *http.Client, per the spec: "used for both that instance's
 	// Directory and its delivery.Client."
-	aAddr, aStore = startTestInstance(t, aCfg, aClient, aClient)
-	bAddr, bStore = startTestInstance(t, bCfg, bClient, bClient)
+	aAddr, aStore, aSigner = startTestInstance(t, aCfg, aClient, aClient)
+	bAddr, bStore, _ = startTestInstance(t, bCfg, bClient, bClient)
 
 	// The redirect table, built once both real addresses are known.
 	aTransport.setTarget("b.loopback.test", bAddr)
@@ -323,7 +332,7 @@ func setupFederationPair(t *testing.T, aRetrySchedule []time.Duration, aOnReques
 	seedAgentRaw(t, aPath, 1, "sender", hashTestBearerToken(senderToken))
 	seedAgentRaw(t, bPath, 1, "recipient", hashTestBearerToken("unused-recipient-token"))
 
-	return aAddr, bAddr, aStore, bStore, aTransport
+	return aAddr, bAddr, aStore, bStore, aTransport, aSigner
 }
 
 // sentMessage is POST /send's response shape (03-API.md: `202 {id,
@@ -414,7 +423,7 @@ func TestIntegrationScenario1_SuccessfulFederatedDelivery(t *testing.T) {
 	t.Parallel()
 
 	const senderToken = "scenario1-sender-token"
-	aAddr, _, aStore, bStore, _ := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
+	aAddr, _, aStore, bStore, _, _ := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
 
 	sent := sendMessage(t, aAddr, senderToken, "recipient@b.loopback.test", "hello", "hi there")
 
@@ -480,7 +489,7 @@ func TestIntegrationScenario2_ForcedFailureRetry(t *testing.T) {
 	}
 
 	const senderToken = "scenario2-sender-token"
-	aAddr, _, aStore, bStore, _ := setupFederationPair(t, shortTestRetrySchedule(), onRequest, senderToken)
+	aAddr, _, aStore, bStore, _, _ := setupFederationPair(t, shortTestRetrySchedule(), onRequest, senderToken)
 
 	sent := sendMessage(t, aAddr, senderToken, "recipient@b.loopback.test", "hello2", "hi there 2")
 
@@ -525,7 +534,7 @@ func TestIntegrationScenario3_ExpiredMessage(t *testing.T) {
 	t.Parallel()
 
 	const senderToken = "scenario3-sender-token"
-	_, _, aStore, bStore, aTransport := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
+	_, _, aStore, bStore, aTransport, _ := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
 
 	// 03-API.md's /send body has no expires_at input field today
 	// (internal/app/send_message.go's SendMessageRequest deliberately
@@ -566,5 +575,422 @@ func TestIntegrationScenario3_ExpiredMessage(t *testing.T) {
 	}
 	if got := aTransport.requests.Load(); got != 0 {
 		t.Errorf("A's delivery-side transport recorded %d request(s), want 0 (an already-expired message must never attempt Directory.Resolve or Client.Deliver)", got)
+	}
+}
+
+// rotateKeyResponse mirrors httpadapter's own unexported POST
+// /admin/keys/rotate 201 response shape ({kid, retired_kid, retire_at}) --
+// duplicated here for the same reason every other wire type in this file
+// is duplicated rather than imported (this package cannot reach an
+// unexported type in a different package, and adapters/test packages
+// never share unexported response types across a package boundary).
+type rotateKeyResponse struct {
+	KID        string    `json:"kid"`
+	RetiredKID string    `json:"retired_kid"`
+	RetireAt   time.Time `json:"retire_at"`
+}
+
+// adminCookieName duplicates httpadapter's own unexported adminCookieName
+// exactly ("cdampd_admin") -- the only way this test (a different package)
+// can build a session cookie adminAuthMiddleware's own check will accept,
+// mirroring hashTestBearerToken's own "duplicates ... exactly" precedent
+// above.
+const adminCookieName = "cdampd_admin"
+
+// rotateKey performs a real HTTP POST /admin/keys/rotate against addr,
+// authenticated with the admin session cookie adminToken (per
+// adminAuthMiddleware's "the cookie value *is* the bootstrap credential"
+// contract), and returns the decoded response.
+func rotateKey(t *testing.T, addr, adminToken string) rotateKeyResponse {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/admin/keys/rotate", nil)
+	if err != nil {
+		t.Fatalf("building POST /admin/keys/rotate request: %v", err)
+	}
+	req.AddCookie(&http.Cookie{Name: adminCookieName, Value: adminToken})
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /admin/keys/rotate: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /admin/keys/rotate status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+
+	var result rotateKeyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decoding POST /admin/keys/rotate response: %v", err)
+	}
+	return result
+}
+
+// startTestAdmin builds and serves the admin HTTP surface (only
+// POST /admin/keys/rotate matters here) for an already-running test
+// instance's store, on its own real ephemeral loopback listener --
+// mirroring run()'s own real composition (cmd/cdampd/main.go): a
+// *signing.Rotator built from the exact live *signing.Ed25519Signer
+// instance startTestInstance already constructed for that instance (see
+// STATUS.md's Phase 8 task 5 spec, design decision 8, for why it must be
+// this exact instance, not a second independently-bootstrapped signer),
+// and a real admin credential bootstrapped via
+// app.BootstrapAdminCredential, the same use case run() itself calls, so
+// the returned adminToken is a real bootstrap token. dashboard is
+// http.NotFoundHandler(): no scenario here exercises /dashboard/, and
+// pulling in internal/adapters/web for a handler that's never invoked
+// would be dead weight.
+func startTestAdmin(t *testing.T, store *sqlite.Store, signer *signing.Ed25519Signer, domainName, passphrase string, grace time.Duration) (addr, adminToken string) {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening for test admin server: %v", err)
+	}
+
+	rotator := signing.NewRotator(store, signer, passphrase, grace)
+
+	adminToken, _, err = app.BootstrapAdminCredential(context.Background(), store)
+	if err != nil {
+		t.Fatalf("bootstrapping admin credential: %v", err)
+	}
+
+	cfg := &config.Config{Domain: domainName, SigningKeyPassphrase: passphrase}
+	mux := httpadapter.NewAdminMux(store, store, store, rotator, http.NotFoundHandler(), cfg)
+
+	go func() {
+		_ = http.Serve(listener, mux)
+	}()
+	t.Cleanup(func() { _ = listener.Close() })
+
+	return listener.Addr().String(), adminToken
+}
+
+// gracePeriodEnvelope mirrors 01-PROTOCOL.md's wire Envelope shape --
+// duplicated here (rather than reusing internal/adapters/delivery's own
+// unexported clientEnvelope or internal/adapters/http's unexported
+// deliverEnvelope) for the same "each package builds its own wire type"
+// reason both of those already give for duplicating each other. Used only
+// by the two grace-period scenarios below, which need to control exactly
+// which signing key signs the envelope and exactly when it's POSTed --
+// neither of which the real async delivery.Worker allows (see
+// STATUS.md's Phase 8 task 5 spec, design decision 7: delivery.Client
+// signs a fresh envelope, with whatever key is live, on every real
+// delivery attempt).
+type gracePeriodEnvelope struct {
+	Version   string    `json:"version"`
+	ID        string    `json:"id"`
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	Subject   string    `json:"subject"`
+	Priority  string    `json:"priority"`
+	Timestamp time.Time `json:"timestamp"`
+	Signature string    `json:"signature"`
+	KID       string    `json:"kid"`
+	ThreadID  string    `json:"thread_id"`
+	Payload   struct {
+		Type    string         `json:"type"`
+		Message string         `json:"message"`
+		Context map[string]any `json:"context"`
+	} `json:"payload"`
+}
+
+// signGracePeriodEnvelope builds a real envelope from
+// "sender@a.loopback.test" to "recipient@b.loopback.test" and signs it by
+// calling signer.Sign directly -- exactly what delivery.Client.Deliver
+// does internally, just invoked here instead of through the worker, so
+// the test controls exactly when signing happens relative to rotation.
+func signGracePeriodEnvelope(t *testing.T, signer *signing.Ed25519Signer, id, subject, body string) gracePeriodEnvelope {
+	t.Helper()
+
+	payload := map[string]any{"type": "request", "message": body, "context": map[string]any{}}
+	canonical, err := app.CanonicalString("sender@a.loopback.test", "recipient@b.loopback.test", subject, "normal", "", payload)
+	if err != nil {
+		t.Fatalf("CanonicalString: %v", err)
+	}
+	sig, kid, err := signer.Sign(canonical)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+
+	env := gracePeriodEnvelope{
+		Version:   "cdamp/0.1",
+		ID:        id,
+		From:      "sender@a.loopback.test",
+		To:        "recipient@b.loopback.test",
+		Subject:   subject,
+		Priority:  "normal",
+		Timestamp: time.Now().UTC(),
+		Signature: base64.StdEncoding.EncodeToString(sig),
+		KID:       kid,
+		ThreadID:  id,
+	}
+	env.Payload.Type = "request"
+	env.Payload.Message = body
+	env.Payload.Context = map[string]any{}
+	return env
+}
+
+// deliverEnvelopeTo POSTs env directly to addr's real POST /deliver
+// endpoint and asserts a 200 -- see signGracePeriodEnvelope's doc comment
+// for why these two scenarios bypass /send and the worker entirely.
+func deliverEnvelopeTo(t *testing.T, addr string, env gracePeriodEnvelope) {
+	t.Helper()
+
+	body, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshaling envelope: %v", err)
+	}
+	resp, err := http.Post("http://"+addr+"/deliver", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST /deliver: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /deliver status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestIntegrationScenario4_PreviousKeyStillVerifies implements
+// STATUS.md's Phase 8 task 5 spec: an envelope signed with A's
+// about-to-be-retired key, delivered to B only after A has actually
+// rotated, still comes out "verified" on B's side via
+// Directory.ResolvePrevious.
+func TestIntegrationScenario4_PreviousKeyStillVerifies(t *testing.T) {
+	t.Parallel()
+
+	const senderToken = "scenario4-sender-token"
+	_, bAddr, aStore, bStore, _, aSigner := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
+
+	// Long grace period: this scenario must never accidentally cross into
+	// "expired" territory mid-test.
+	adminAddr, adminToken := startTestAdmin(t, aStore, aSigner, "a.loopback.test", "test-passphrase-a", time.Hour)
+
+	env := signGracePeriodEnvelope(t, aSigner, "msg_scenario4_previous_key", "grace period", "signed with the pre-rotation key")
+
+	rotated := rotateKey(t, adminAddr, adminToken)
+	if rotated.RetiredKID != env.KID {
+		t.Fatalf("rotated away from kid %q, want %q (the key that actually signed this envelope)", rotated.RetiredKID, env.KID)
+	}
+
+	deliverEnvelopeTo(t, bAddr, env)
+
+	got, err := bStore.GetMessage(context.Background(), env.ID)
+	if err != nil {
+		t.Fatalf("GetMessage on B: %v", err)
+	}
+	if got.Trust != "verified" {
+		t.Errorf(`trust = %q, want "verified" (signed with A's previous, still-in-grace key)`, got.Trust)
+	}
+}
+
+// TestIntegrationScenario5_ExpiredPreviousKeyUntrusted implements
+// STATUS.md's Phase 8 task 5 spec: an envelope signed with A's key, whose
+// grace period has since fully elapsed by the time it's delivered, comes
+// out "untrusted" -- not an error -- on B's side.
+func TestIntegrationScenario5_ExpiredPreviousKeyUntrusted(t *testing.T) {
+	t.Parallel()
+
+	const senderToken = "scenario5-sender-token"
+	_, bAddr, aStore, bStore, _, aSigner := setupFederationPair(t, shortTestRetrySchedule(), nil, senderToken)
+
+	const grace = 2 * time.Second
+	adminAddr, adminToken := startTestAdmin(t, aStore, aSigner, "a.loopback.test", "test-passphrase-a", grace)
+
+	env := signGracePeriodEnvelope(t, aSigner, "msg_scenario5_expired_previous_key", "expired grace", "signed with a key whose grace period will elapse")
+
+	rotateKey(t, adminAddr, adminToken)
+
+	// Let the short grace period fully elapse -- see STATUS.md's Phase 8
+	// task 5 spec, design decision 9, for why a bounded real sleep (not
+	// polling, not a fake clock) is the correct tool here.
+	time.Sleep(grace + 2*time.Second)
+
+	deliverEnvelopeTo(t, bAddr, env)
+
+	got, err := bStore.GetMessage(context.Background(), env.ID)
+	if err != nil {
+		t.Fatalf("GetMessage on B: %v", err)
+	}
+	if got.Trust != "untrusted" {
+		t.Errorf(`trust = %q, want "untrusted" (signed with a previous key whose grace period has elapsed)`, got.Trust)
+	}
+}
+
+// archiveDBPathForTest mirrors internal/adapters/storage/sqlite's own
+// unexported archiveDBPath exactly (same directory as the main SQLite
+// file, fixed filename "archive.db") -- duplicated here since this
+// package cannot reach that unexported function, same category as
+// hashTestBearerToken's own "duplicates ... exactly" precedent.
+func archiveDBPathForTest(mainPath string) string {
+	return filepath.Join(filepath.Dir(mainPath), "archive.db")
+}
+
+// waitForArchivedMessage polls sqlitePath's *archive* database (opened
+// directly, bypassing the unexported *sqlite.Store, the same way
+// seedAgentRaw already opens a raw *sql.DB against the main file) until
+// id's row appears there, bounded by timeout -- proving the Archiver
+// actually moved the row, not merely that the message is still readable
+// (which would be true even if archival had never run at all, since
+// Store's own read methods already merge both databases -- see
+// STATUS.md's Phase 8 task 5 spec, design decision 10).
+func waitForArchivedMessage(t *testing.T, sqlitePath, id string, timeout time.Duration) {
+	t.Helper()
+
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", archiveDBPathForTest(sqlitePath))
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		db, err := sql.Open("sqlite", dsn)
+		if err == nil {
+			var count int
+			scanErr := db.QueryRow("SELECT COUNT(*) FROM messages WHERE id = ?", id).Scan(&count)
+			db.Close()
+			if scanErr == nil && count == 1 {
+				return
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("message %s never appeared in archive.db within %s", id, timeout)
+}
+
+// messageAPIResponse mirrors internal/adapters/http/local.go's own
+// unexported messageResponse shape -- duplicated per this file's own
+// established "each package/test builds its own wire type" convention.
+// Only the fields Scenario 6 actually asserts on are included.
+type messageAPIResponse struct {
+	ID      string `json:"id"`
+	Subject string `json:"subject"`
+	Body    string `json:"body"`
+}
+
+func doAuthedGet(t *testing.T, addr, token, path string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, "http://"+addr+path, nil)
+	if err != nil {
+		t.Fatalf("building GET %s request: %v", path, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	return resp
+}
+
+func getMessageViaAPI(t *testing.T, addr, token, id string) messageAPIResponse {
+	t.Helper()
+	resp := doAuthedGet(t, addr, token, "/messages/"+id)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /messages/%s status = %d, want 200", id, resp.StatusCode)
+	}
+	var got messageAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decoding GET /messages/%s response: %v", id, err)
+	}
+	return got
+}
+
+func getThreadViaAPI(t *testing.T, addr, token, id string) []messageAPIResponse {
+	t.Helper()
+	resp := doAuthedGet(t, addr, token, "/threads/"+id)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /threads/%s status = %d, want 200", id, resp.StatusCode)
+	}
+	var body struct {
+		Messages []messageAPIResponse `json:"messages"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding GET /threads/%s response: %v", id, err)
+	}
+	return body.Messages
+}
+
+func listMessagesViaAPI(t *testing.T, addr, token, query string) []messageAPIResponse {
+	t.Helper()
+	resp := doAuthedGet(t, addr, token, "/messages?q="+url.QueryEscape(query))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /messages?q=%s status = %d, want 200", query, resp.StatusCode)
+	}
+	var body struct {
+		Messages []messageAPIResponse `json:"messages"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding GET /messages?q=%s response: %v", query, err)
+	}
+	return body.Messages
+}
+
+// TestIntegrationScenario6_ArchivedMessageReadableViaAPI implements
+// STATUS.md's Phase 8 task 5 spec: a message old enough and read=1 is
+// actually moved into archive.db by a real Archiver, then GET
+// /messages/{id}, GET /threads/{id}, and GET /messages?q=<matching term>
+// against the real local API all still return it correctly.
+func TestIntegrationScenario6_ArchivedMessageReadableViaAPI(t *testing.T) {
+	t.Parallel()
+
+	const recipientToken = "scenario6-recipient-token"
+	cfg := &config.Config{
+		Domain:               "archive.loopback.test",
+		ListenAddr:           "127.0.0.1:0",
+		SQLitePath:           filepath.Join(t.TempDir(), "archive-scenario.db"),
+		SigningKeyPassphrase: "test-passphrase-archive",
+		RetrySchedule:        shortTestRetrySchedule(),
+		DirectoryCacheTTL:    5 * time.Minute,
+	}
+	addr, store, _ := startTestInstance(t, cfg, nil, nil)
+	seedAgentRaw(t, cfg.SQLitePath, 1, "recipient", hashTestBearerToken(recipientToken))
+
+	sentAt := time.Now().Add(-48 * time.Hour)
+	msg := &domain.Message{
+		ID:           "msg_scenario6_archived",
+		ThreadID:     "msg_scenario6_archived",
+		AgentID:      1,
+		Direction:    "in",
+		From:         "sender@other.loopback.test",
+		To:           "recipient@archive.loopback.test",
+		SenderDomain: "other.loopback.test",
+		Subject:      "an archived thread",
+		Body:         "distinctivearchivalword",
+		Priority:     "normal",
+		SentAt:       sentAt,
+		Trust:        "external",
+		Status:       "received",
+		Read:         true,
+	}
+	if err := store.SaveMessage(context.Background(), msg); err != nil {
+		t.Fatalf("seeding archivable message: %v", err)
+	}
+
+	archiver := sqlite.NewArchiver(store, 24*time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go archiver.Run(ctx)
+
+	waitForArchivedMessage(t, cfg.SQLitePath, msg.ID, 10*time.Second)
+
+	got := getMessageViaAPI(t, addr, recipientToken, msg.ID)
+	if got.Subject != msg.Subject || got.Body != msg.Body {
+		t.Errorf("GET /messages/{id} returned subject=%q body=%q, want %q / %q", got.Subject, got.Body, msg.Subject, msg.Body)
+	}
+
+	threadMsgs := getThreadViaAPI(t, addr, recipientToken, msg.ThreadID)
+	if len(threadMsgs) != 1 || threadMsgs[0].ID != msg.ID {
+		t.Errorf("GET /threads/{id} returned %d message(s), want 1 matching %q", len(threadMsgs), msg.ID)
+	}
+
+	listed := listMessagesViaAPI(t, addr, recipientToken, "distinctivearchivalword")
+	found := false
+	for _, m := range listed {
+		if m.ID == msg.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("GET /messages?q=... did not return the archived message %q", msg.ID)
 	}
 }

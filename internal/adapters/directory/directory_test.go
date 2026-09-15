@@ -313,3 +313,184 @@ func TestResolve_NegativeResultsNotCached(t *testing.T) {
 		t.Errorf("requests after second call = %d, want 2 (404 must not be cached)", got)
 	}
 }
+
+func TestResolvePrevious_Success(t *testing.T) {
+	pub := mustPubkey(t)
+	wantB64 := base64.StdEncoding.EncodeToString(pub)
+
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		if r.URL.Path != "/.well-known/cdamp/keys" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{
+			Previous: &wellKnownKeyClientEntry{KID: "k1", PubKey: wantB64},
+		})
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	pubkey, kid, err := d.ResolvePrevious(context.Background(), "alice@example.dev")
+	if err != nil {
+		t.Fatalf("ResolvePrevious: unexpected error: %v", err)
+	}
+	if !pubkey.Equal(pub) {
+		t.Errorf("pubkey = %x, want %x", pubkey, pub)
+	}
+	if kid != "k1" {
+		t.Errorf("kid = %q, want %q", kid, "k1")
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("requests = %d, want 1", got)
+	}
+}
+
+func TestResolvePrevious_NotFoundWhenOmitted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{}) // no Previous
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	_, _, err := d.ResolvePrevious(context.Background(), "alice@example.dev")
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("ResolvePrevious: error = %v, want errors.Is(err, domain.ErrNotFound)", err)
+	}
+}
+
+func TestResolvePrevious_ServerError_NotErrNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	_, _, err := d.ResolvePrevious(context.Background(), "alice@example.dev")
+	if err == nil {
+		t.Fatal("ResolvePrevious: expected error, got nil")
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("ResolvePrevious: error = %v, want NOT errors.Is(err, domain.ErrNotFound)", err)
+	}
+}
+
+func TestResolvePrevious_MalformedBase64Pubkey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{
+			Previous: &wellKnownKeyClientEntry{KID: "k1", PubKey: "not-valid-base64!!!"},
+		})
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	_, _, err := d.ResolvePrevious(context.Background(), "alice@example.dev")
+	if err == nil {
+		t.Fatal("ResolvePrevious: expected error, got nil")
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("ResolvePrevious: error = %v, want NOT errors.Is(err, domain.ErrNotFound)", err)
+	}
+}
+
+func TestResolvePrevious_CacheHit(t *testing.T) {
+	pub := mustPubkey(t)
+	wantB64 := base64.StdEncoding.EncodeToString(pub)
+
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{
+			Previous: &wellKnownKeyClientEntry{KID: "k1", PubKey: wantB64},
+		})
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	ctx := context.Background()
+
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("first ResolvePrevious: unexpected error: %v", err)
+	}
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("second ResolvePrevious: unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("requests = %d, want 1 (second call should hit cache)", got)
+	}
+}
+
+func TestResolvePrevious_CacheExpiry(t *testing.T) {
+	pub := mustPubkey(t)
+	wantB64 := base64.StdEncoding.EncodeToString(pub)
+
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{
+			Previous: &wellKnownKeyClientEntry{KID: "k1", PubKey: wantB64},
+		})
+	}))
+	defer srv.Close()
+
+	ttl := time.Hour
+	d := newTestDirectory(t, srv, ttl)
+	current := time.Now()
+	d.now = func() time.Time { return current }
+
+	ctx := context.Background()
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("first ResolvePrevious: unexpected error: %v", err)
+	}
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("second ResolvePrevious: unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Fatalf("requests after two calls within TTL = %d, want 1", got)
+	}
+
+	current = current.Add(ttl + time.Second)
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("third ResolvePrevious: unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 2 {
+		t.Errorf("requests after TTL expiry = %d, want 2", got)
+	}
+}
+
+// TestResolvePrevious_CachedPerDomainNotPerAddress proves design decision
+// 4: GET /.well-known/cdamp/keys is a domain-scoped endpoint, so two
+// different agent addresses at the same domain must share one cache
+// entry (and one HTTP request), unlike Resolve's own per-address cache.
+func TestResolvePrevious_CachedPerDomainNotPerAddress(t *testing.T) {
+	pub := mustPubkey(t)
+	wantB64 := base64.StdEncoding.EncodeToString(pub)
+
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(wellKnownKeysClientResponse{
+			Previous: &wellKnownKeyClientEntry{KID: "k1", PubKey: wantB64},
+		})
+	}))
+	defer srv.Close()
+
+	d := newTestDirectory(t, srv, time.Hour)
+	ctx := context.Background()
+
+	if _, _, err := d.ResolvePrevious(ctx, "alice@example.dev"); err != nil {
+		t.Fatalf("ResolvePrevious(alice): unexpected error: %v", err)
+	}
+	if _, _, err := d.ResolvePrevious(ctx, "bob@example.dev"); err != nil {
+		t.Fatalf("ResolvePrevious(bob): unexpected error: %v", err)
+	}
+	if got := atomic.LoadInt32(&requests); got != 1 {
+		t.Errorf("requests = %d, want 1 (same domain, two different agent addresses)", got)
+	}
+}

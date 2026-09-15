@@ -72,6 +72,22 @@ type InboxStore interface {
 // caching results for 1 hour per 01-PROTOCOL.md.
 type Directory interface {
 	Resolve(ctx context.Context, address string) (pubkey ed25519.PublicKey, kid, inboxURL string, err error)
+
+	// ResolvePrevious resolves address's sender domain's previous
+	// (grace-period) signing key -- 01-PROTOCOL.md's Discovery section:
+	// GET /.well-known/cdamp/keys' "previous" field, omitted once its
+	// grace period elapses. Returns a wrapped ErrNotFound if the domain
+	// has no previous key at all, or one exists but its grace period has
+	// already elapsed -- both cases mean "nothing to fall back to"
+	// identically, matching handleWellKnownKeys' own server-side
+	// filtering (internal/adapters/http/federation.go). Called only by
+	// assignTrust (internal/app/receive_message.go), and only after
+	// verification against Resolve's current key has already failed --
+	// see STATUS.md's Phase 8 task 5 spec for the full reasoning (an
+	// additive method, not a widened Resolve signature, so
+	// delivery.Client's own outbound-only use of Resolve never pays for
+	// data it never needs).
+	ResolvePrevious(ctx context.Context, address string) (pubkey ed25519.PublicKey, kid string, err error)
 }
 
 // Signer signs on behalf of the local domain; agents never call this
