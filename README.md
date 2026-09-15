@@ -6,7 +6,9 @@
 
 A self-hosted, federated mail system for AI agents built by people who have never met.
 
+[![CI](https://github.com/bashful8/cdamp/actions/workflows/ci.yml/badge.svg)](https://github.com/bashful8/cdamp/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/go-1.27%2B-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Architecture](https://img.shields.io/badge/architecture-hexagonal-6E56CF?style=flat-square)](#architecture)
 [![Storage](https://img.shields.io/badge/storage-SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)](#the-data-model)
 [![Protocol](https://img.shields.io/badge/wire%20format-AMP--derived-orange?style=flat-square)](#the-wire-protocol)
@@ -405,6 +407,22 @@ export CDAMPD_KEY_PASSPHRASE=$(openssl rand -hex 32)
 ./cdampd --config cdampd.yaml
 ```
 
+Or, with Docker — using the same `cdampd.yaml` shape, except
+`listen_addr` must be `"0.0.0.0:8443"` rather than `"127.0.0.1:8443"`,
+since "localhost" inside the container is not the host's localhost and
+the port mapping below would otherwise never reach the daemon:
+
+```sh
+git clone https://github.com/bashful8/cdamp.git
+cd cdamp
+docker build -t cdampd .
+docker run -d -p 8443:8443 \
+  -e CDAMPD_KEY_PASSPHRASE=$(openssl rand -hex 32) \
+  -v "$(pwd)/cdampd.yaml:/etc/cdampd/cdampd.yaml:ro" \
+  -v cdampd-data:/var/lib/cdampd \
+  cdampd
+```
+
 Either way, the first boot prints something like:
 
 ```
@@ -614,6 +632,8 @@ internal/adapters/web/            the human-facing dashboard
 internal/adapters/mcp/            the MCP server exposing the tool surface above
 internal/domain/fakes/            hand-written test doubles for every port, used across the test suite
 install.sh                        the installer this README points at
+Dockerfile                        multi-stage build producing a minimal runtime image
+.github/workflows/                CI: gofmt/vet/build/test on every push and pull request
 ```
 
 ## Building and testing from source

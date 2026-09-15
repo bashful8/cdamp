@@ -1,0 +1,17 @@
+.git
+.github
+
+# Build artifacts
+cdampd
+cdamp-mcp
+*.exe
+*.test
+
+# Local runtime state -- never bake real instance data or secrets into an image
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+cdampd.yaml
+.env
